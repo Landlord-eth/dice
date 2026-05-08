@@ -1,0 +1,8 @@
+/out/
+/cache/
+/logs/
+/broadcast/
+.env
+.env.*
+**/node_modules/
+.DS_Store
