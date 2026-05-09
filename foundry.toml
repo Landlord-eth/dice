@@ -1,0 +1,38 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 2000
+via_ir = true
+bytecode_hash = "none"
+gas_limit = "18446744073709551615"
+fs_permissions = [{ access = "read", path = "./research/data" }, { access = "read-write", path = "./research/out" }]
+remappings = [
+  "v4-core/=lib/v4-core/src/",
+  "v4-core-test/=lib/v4-core/test/",
+  "forge-std/=lib/forge-std/src/",
+  "solmate/=lib/v4-core/lib/solmate/src/",
+  "@openzeppelin/=lib/v4-core/lib/openzeppelin-contracts/",
+]
+
+# fork state read during tests is cached per block, so a pinned run replays offline
+rpc_storage_caching = { chains = "all", endpoints = "all" }
+
+[lint]
+# tests and the deploy script cast freely between amounts they built themselves
+ignore = ["test/**/*.sol", "script/**/*.sol"]
+
+[profile.default.fuzz]
+runs = 512
+seed = "0x1a4d"
+
+[profile.default.invariant]
+runs = 64
+depth = 120
+fail_on_revert = false
+
+[rpc_endpoints]
+hood = "https://rpc.mainnet.chain.robinhood.com"
