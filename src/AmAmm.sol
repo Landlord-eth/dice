@@ -78,3 +78,58 @@ abstract contract AmAmm {
     // ---------------------------------------------------------------------
     // Bidder actions
     // ---------------------------------------------------------------------
+
+    /// @notice Queue a bid for the seat. It can take over K blocks from now. The deposit is
+    /// pulled from msg.sender; `manager` owns the bid, its refunds and its fees.
+    function bid(PoolId id, address manager, uint24 fee, uint128 rent, uint128 deposit)
+        public
+        virtual
+        onlyAmAmmEnabled(id)
+    {
+        _updateAmAmmWrite(id);
+
+        if (
+            manager == address(0) || rent <= _mulWad(_nextBids[id].rent, MIN_BID_MULTIPLIER) || rent < _minRent(id)
+                || deposit < rent * K || deposit % rent != 0 || fee > FEE_CAP
+        ) revert AmAmm__InvalidBid();
+
+        // the outbid queued bid gets its whole deposit back: it never held the seat
+        _refunds[_nextBids[id].manager][id] += _nextBids[id].deposit;
+
+        uint48 blockIdx = _blockIdx();
+        _nextBids[id] = Bid(manager, blockIdx, fee, fee, rent, deposit, 0);
+
+        _pullBidToken(msg.sender, deposit);
+
+        emit SubmitBid(id, manager, blockIdx, fee, rent, deposit);
+    }
+
+    function depositIntoBid(PoolId id, uint128 amount, bool isTopBid) public virtual onlyAmAmmEnabled(id) {
+        _updateAmAmmWrite(id);
+
+        Bid storage b = isTopBid ? _topBids[id] : _nextBids[id];
+        if (msg.sender != b.manager) revert AmAmm__Unauthorized();
+        if (amount % b.rent != 0) revert AmAmm__InvalidDepositAmount();
+
+        b.deposit += amount;
+
+        _pullBidToken(msg.sender, amount);
+
+        emit DepositIntoBid(id, msg.sender, isTopBid, amount);
+    }
+
+    /// @notice Take back deposit, leaving at least K blocks of rent: a bid can never stop paying
+    /// sooner than K blocks from now (paper: D_top >= R_top * K).
+    function withdrawFromBid(PoolId id, uint128 amount, address recipient, bool isTopBid)
+        public
+        virtual
+        onlyAmAmmEnabled(id)
+    {
+        _updateAmAmmWrite(id);
+
+        Bid storage b = isTopBid ? _topBids[id] : _nextBids[id];
+        Bid memory m = b;
+        if (msg.sender != m.manager) revert AmAmm__Unauthorized();
+        if (amount % m.rent != 0) revert AmAmm__InvalidDepositAmount();
+        if (amount > m.deposit || (m.deposit - amount) / m.rent < K) revert AmAmm__BidLocked();
+
