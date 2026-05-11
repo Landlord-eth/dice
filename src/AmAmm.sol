@@ -193,3 +193,58 @@ abstract contract AmAmm {
 
     // ---------------------------------------------------------------------
     // Getters
+    // ---------------------------------------------------------------------
+
+    /// @notice The bid as it stands at the current block (rent charged, promotions applied).
+    function getBid(PoolId id, bool isTopBid) external view returns (Bid memory) {
+        (Bid memory topBid, Bid memory nextBid) = _updateAmAmmView(id);
+        return isTopBid ? topBid : nextBid;
+    }
+
+    /// @notice Robinhood Chain block at deployment; bid `blockIdx` values count blocks from here.
+    function deploymentBlockNumber() external view returns (uint256) {
+        return _deploymentBlockNumber;
+    }
+
+    function getRefund(address manager, PoolId id) external view returns (uint256) {
+        return _refunds[manager][id];
+    }
+
+    function getFees(address manager, Currency currency) external view returns (uint256) {
+        return _fees[manager][currency];
+    }
+
+    // ---------------------------------------------------------------------
+    // Hooks for the pool contract
+    // ---------------------------------------------------------------------
+
+    function _amAmmEnabled(PoolId id) internal view virtual returns (bool);
+
+    /// @dev Reserve rent for a pool at bid time, in quote units per block.
+    function _minRent(PoolId id) internal view virtual returns (uint128);
+
+    /// @dev Rent charged from the seat holder's deposit, already held by this contract.
+    function _chargeRent(PoolId id, uint256 amount) internal virtual;
+
+    function _pullBidToken(address from, uint256 amount) internal virtual;
+
+    function _pushBidToken(address to, uint256 amount) internal virtual;
+
+    function _transferFeeToken(Currency currency, address to, uint256 amount) internal virtual;
+
+    function _accrueFees(address manager, Currency currency, uint256 amount) internal {
+        _fees[manager][currency] += amount;
+        _totalFees[currency] += amount;
+    }
+
+    // ---------------------------------------------------------------------
+    // State machine
+    // ---------------------------------------------------------------------
+
+    /// @dev Robinhood Chain's own block number (BidDog's BlockNumberLib does the same on Arbitrum One).
+    function _blockNumber() internal view returns (uint256) {
+        return block.chainid == ROBINHOOD_CHAIN_ID ? ArbSys(address(100)).arbBlockNumber() : block.number;
+    }
+
+    function _blockIdx() internal view returns (uint48) {
+        // 2^48 blocks is 890,000 years at 0.1 s
