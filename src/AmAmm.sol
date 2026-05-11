@@ -133,3 +133,63 @@ abstract contract AmAmm {
         if (amount % m.rent != 0) revert AmAmm__InvalidDepositAmount();
         if (amount > m.deposit || (m.deposit - amount) / m.rent < K) revert AmAmm__BidLocked();
 
+        b.deposit = m.deposit - amount;
+
+        _pushBidToken(recipient, amount);
+
+        emit WithdrawFromBid(id, msg.sender, recipient, isTopBid, amount);
+    }
+
+    function claimRefund(PoolId id, address recipient) public virtual onlyAmAmmEnabled(id) returns (uint256 refund) {
+        _updateAmAmmWrite(id);
+
+        refund = _refunds[msg.sender][id];
+        if (refund == 0) return 0;
+        delete _refunds[msg.sender][id];
+
+        _pushBidToken(recipient, refund);
+
+        emit ClaimRefund(id, msg.sender, recipient, refund);
+    }
+
+    function claimFees(Currency currency, address recipient) public virtual returns (uint256 fees) {
+        fees = _fees[msg.sender][currency];
+        if (fees == 0) return 0;
+        delete _fees[msg.sender][currency];
+        unchecked {
+            // _totalFees[currency] is the sum of every manager's fees in that currency
+            _totalFees[currency] -= fees;
+        }
+
+        _transferFeeToken(currency, recipient, fees);
+
+        emit ClaimFees(currency, msg.sender, recipient, fees);
+    }
+
+    /// @notice Change the fee of your bid. On the live seat the new fee applies from the next
+    /// block, so a holder cannot reprice a block it has already seen.
+    function setBidFee(PoolId id, uint24 fee, bool isTopBid) public virtual onlyAmAmmEnabled(id) {
+        _updateAmAmmWrite(id);
+
+        if (fee > FEE_CAP) revert AmAmm__InvalidFee();
+        Bid storage b = isTopBid ? _topBids[id] : _nextBids[id];
+        if (msg.sender != b.manager) revert AmAmm__Unauthorized();
+
+        uint48 idx = _blockIdx();
+        if (isTopBid) {
+            b.prevFee = _feeAt(b, idx);
+            b.feeBlockIdx = idx;
+        } else {
+            b.prevFee = fee;
+        }
+        b.fee = fee;
+
+        emit SetFee(id, msg.sender, isTopBid, fee);
+    }
+
+    function updateStateMachine(PoolId id) external {
+        _updateAmAmmWrite(id);
+    }
+
+    // ---------------------------------------------------------------------
+    // Getters
