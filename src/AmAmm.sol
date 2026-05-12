@@ -248,3 +248,63 @@ abstract contract AmAmm {
 
     function _blockIdx() internal view returns (uint48) {
         // 2^48 blocks is 890,000 years at 0.1 s
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint48(_blockNumber() - _deploymentBlockNumber);
+    }
+
+    function _feeAt(Bid memory b, uint48 idx) internal pure returns (uint24) {
+        return idx > b.feeBlockIdx ? b.fee : b.prevFee;
+    }
+
+    function _mulWad(uint128 x, uint256 y) private pure returns (uint256) {
+        return uint256(x) * y / 1e18;
+    }
+
+    /// @dev Charges rent and applies promotions up to the current block. Idempotent within a block.
+    function _updateAmAmmWrite(PoolId id) internal {
+        uint48 currentBlockIdx = _blockIdx();
+        if (_lastUpdatedBlockIdx[id] == currentBlockIdx) return;
+
+        Bid memory topBid = _topBids[id];
+        Bid memory nextBid = _nextBids[id];
+        bool updatedTopBid;
+        bool updatedNextBid;
+        uint256 rentCharged;
+
+        while (true) {
+            (
+                Bid memory t,
+                Bid memory n,
+                bool stepUpdatedTop,
+                bool stepUpdatedNext,
+                uint256 stepRent,
+                address refundManager,
+                uint256 refundAmount
+            ) = _stateTransition(currentBlockIdx, topBid, nextBid);
+            if (!stepUpdatedTop && !stepUpdatedNext) break;
+            (topBid, nextBid) = (t, n);
+            updatedTopBid = updatedTopBid || stepUpdatedTop;
+            updatedNextBid = updatedNextBid || stepUpdatedNext;
+            rentCharged += stepRent;
+            if (refundManager != address(0)) _refunds[refundManager][id] += refundAmount;
+        }
+
+        if (updatedTopBid) _topBids[id] = topBid;
+        if (updatedNextBid) _nextBids[id] = nextBid;
+        _lastUpdatedBlockIdx[id] = currentBlockIdx;
+
+        if (rentCharged != 0) _chargeRent(id, rentCharged);
+    }
+
+    function _updateAmAmmView(PoolId id) internal view returns (Bid memory topBid, Bid memory nextBid) {
+        uint48 currentBlockIdx = _blockIdx();
+        topBid = _topBids[id];
+        nextBid = _nextBids[id];
+        if (_lastUpdatedBlockIdx[id] == currentBlockIdx) return (topBid, nextBid);
+
+        while (true) {
+            (Bid memory t, Bid memory n, bool stepUpdatedTop, bool stepUpdatedNext,,,) =
+                _stateTransition(currentBlockIdx, topBid, nextBid);
+            if (!stepUpdatedTop && !stepUpdatedNext) break;
+            (topBid, nextBid) = (t, n);
+        }
