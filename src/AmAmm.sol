@@ -308,3 +308,58 @@ abstract contract AmAmm {
             if (!stepUpdatedTop && !stepUpdatedNext) break;
             (topBid, nextBid) = (t, n);
         }
+    }
+
+    /// @dev One step of BidDog's machine. A: no seat, no queue. B: seat, no queue.
+    /// C: no seat, queue. D: seat and queue.
+    /// A -bid-> C -K blocks-> B -deposit runs out-> A; B -bid-> D; D -K blocks, queue beats seat by 10%-> B;
+    /// D -seat deposit runs out-> C; C and D -higher bid-> same state with the new queue.
+    function _stateTransition(uint48 currentBlockIdx, Bid memory topBid, Bid memory nextBid)
+        internal
+        pure
+        returns (
+            Bid memory,
+            Bid memory,
+            bool updatedTopBid,
+            bool updatedNextBid,
+            uint256 rentCharged,
+            address refundManager,
+            uint256 refundAmount
+        )
+    {
+        if (nextBid.manager == address(0)) {
+            if (topBid.manager != address(0)) {
+                // State B: charge rent
+                uint256 rentOwed = uint256(currentBlockIdx - topBid.blockIdx) * topBid.rent;
+                if (rentOwed >= topBid.deposit) {
+                    // B -> A: the deposit ran out
+                    rentCharged = topBid.deposit;
+                    topBid = _emptyBid();
+                    updatedTopBid = true;
+                } else if (rentOwed != 0) {
+                    rentCharged = rentOwed;
+                    // rentOwed < deposit, a uint128
+                    // forge-lint: disable-next-line(unsafe-typecast)
+                    topBid.deposit -= uint128(rentOwed);
+                    topBid.blockIdx = currentBlockIdx;
+                    updatedTopBid = true;
+                }
+            }
+        } else if (topBid.manager == address(0)) {
+            // State C: promote the queued bid once K blocks have passed
+            uint48 nextBidStartBlockIdx = nextBid.blockIdx + K;
+            if (currentBlockIdx >= nextBidStartBlockIdx) {
+                topBid = nextBid;
+                topBid.blockIdx = nextBidStartBlockIdx;
+                nextBid = _emptyBid();
+                updatedTopBid = true;
+                updatedNextBid = true;
+            }
+        } else {
+            // State D: the holder pays until the queued bid's start block, if the queued bid
+            // beats it by more than 10%; otherwise the queued bid waits for the seat to run dry
+            bool nextBidIsBetter = nextBid.rent > _mulWad(topBid.rent, MIN_BID_MULTIPLIER);
+            uint48 nextBidStartBlockIdx = nextBid.blockIdx + K;
+            uint48 chargeUntil =
+                nextBidIsBetter && nextBidStartBlockIdx < currentBlockIdx ? nextBidStartBlockIdx : currentBlockIdx;
+            // chargeUntil >= topBid.blockIdx: a queued bid always lands after the holder's last charge
