@@ -363,3 +363,46 @@ abstract contract AmAmm {
             uint48 chargeUntil =
                 nextBidIsBetter && nextBidStartBlockIdx < currentBlockIdx ? nextBidStartBlockIdx : currentBlockIdx;
             // chargeUntil >= topBid.blockIdx: a queued bid always lands after the holder's last charge
+            uint256 rentOwed = uint256(chargeUntil - topBid.blockIdx) * topBid.rent;
+            if (rentOwed >= topBid.deposit) {
+                // D -> C: the holder ran dry. The queued bid starts at the later of its own start
+                // block and the exact block the deposit ran out (deposits are multiples of rent).
+                // BidDog uses the block of this update instead, which leaves the blocks between the
+                // run-out and the next touch of the pool unpaid; the exact block makes a lazily
+                // updated pool charge the same rent as one updated every block.
+                // fits: rentOwed >= deposit means deposit / rent <= blocks elapsed
+                // forge-lint: disable-next-line(unsafe-typecast)
+                uint48 dryBlockIdx = topBid.blockIdx + uint48(topBid.deposit / topBid.rent);
+                rentCharged = topBid.deposit;
+                topBid = _emptyBid();
+                if (dryBlockIdx >= K && nextBid.blockIdx < dryBlockIdx - K) nextBid.blockIdx = dryBlockIdx - K;
+                updatedTopBid = true;
+                updatedNextBid = true;
+            } else {
+                if (rentOwed != 0) {
+                    rentCharged = rentOwed;
+                    // rentOwed < deposit, a uint128
+                    // forge-lint: disable-next-line(unsafe-typecast)
+                    topBid.deposit -= uint128(rentOwed);
+                    topBid.blockIdx = currentBlockIdx;
+                    updatedTopBid = true;
+                }
+                if (currentBlockIdx >= nextBidStartBlockIdx && nextBidIsBetter) {
+                    // D -> B: the queued bid takes the seat at its start block; the holder keeps
+                    // the deposit it did not use
+                    (refundManager, refundAmount) = (topBid.manager, topBid.deposit);
+                    topBid = nextBid;
+                    topBid.blockIdx = nextBidStartBlockIdx;
+                    nextBid = _emptyBid();
+                    updatedTopBid = true;
+                    updatedNextBid = true;
+                }
+            }
+        }
+        return (topBid, nextBid, updatedTopBid, updatedNextBid, rentCharged, refundManager, refundAmount);
+    }
+
+    function _emptyBid() private pure returns (Bid memory) {
+        return Bid(address(0), 0, 0, 0, 0, 0, 0);
+    }
+}
