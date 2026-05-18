@@ -98,3 +98,48 @@ contract Landlord is AmAmm, IHooks, IUnlockCallback {
 
     IPoolManager public immutable poolManager;
     /// @notice The rent and bid currency, one side of every pool (USDG on Robinhood Chain).
+    Currency public immutable quote;
+    /// @notice The token bought and burned with the rent's burn share.
+    Currency public immutable burnToken;
+    // burn pool key, stored field by field (immutables cannot be structs)
+    Currency private immutable burnCurrency0;
+    Currency private immutable burnCurrency1;
+    uint24 private immutable burnFee;
+    int24 private immutable burnTickSpacing;
+
+    struct Pool {
+        bool registered;
+        bool quoteIs0;
+        uint128 liquidity; // sum of LP liquidity; equals the hook's position in the PoolManager
+        uint256 rentPerLiquidityX128;
+        uint256 fee0PerLiquidityX128;
+        uint256 fee1PerLiquidityX128;
+    }
+
+    struct Position {
+        uint128 liquidity;
+        uint256 rentCheckpointX128;
+        uint256 fee0CheckpointX128;
+        uint256 fee1CheckpointX128;
+        uint256 owed0;
+        uint256 owed1;
+    }
+
+    mapping(PoolId => Pool) public pools;
+    mapping(PoolId => mapping(address => Position)) public positions;
+
+    /// @notice Quote waiting to be spent by `crankBurn`.
+    uint256 public burnBucket;
+    uint256 public totalBurnSpent;
+    uint256 public totalBurned;
+    uint256 public lastBurnBlock;
+
+    enum Action {
+        Add,
+        Remove,
+        Burn
+    }
+
+    modifier onlyPoolManager() {
+        if (msg.sender != address(poolManager)) revert NotPoolManager();
+        _;
