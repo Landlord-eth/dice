@@ -198,3 +198,93 @@ contract Landlord is AmAmm, IHooks, IUnlockCallback {
         burnFee = burnPoolKey_.fee;
         burnTickSpacing = burnPoolKey_.tickSpacing;
     }
+
+    // ---------------------------------------------------------------------
+    // Liquidity
+    // ---------------------------------------------------------------------
+
+    /// @notice Add full-range liquidity. Pays at most `amount0Max` / `amount1Max`; reverts unless the
+    /// pool price is inside [`sqrtPriceMinX96`, `sqrtPriceMaxX96`] so a moved price cannot fill the order.
+    function addLiquidity(
+        PoolKey calldata key,
+        uint128 liquidity,
+        uint256 amount0Max,
+        uint256 amount1Max,
+        uint160 sqrtPriceMinX96,
+        uint160 sqrtPriceMaxX96
+    ) external nonReentrant returns (uint256 amount0, uint256 amount1) {
+        PoolId id = key.toId();
+        Pool storage pool = _registered(id);
+        if (liquidity == 0) revert ZeroLiquidity();
+        _checkPrice(id, sqrtPriceMinX96, sqrtPriceMaxX96);
+
+        _updateAmAmmWrite(id);
+        Position storage pos = positions[id][msg.sender];
+        _accrue(pool, pos);
+        pos.liquidity += liquidity;
+        pool.liquidity += liquidity;
+
+        (amount0, amount1) = abi.decode(
+            poolManager.unlock(abi.encode(Action.Add, abi.encode(key, msg.sender, liquidity))), (uint256, uint256)
+        );
+        if (amount0 > amount0Max || amount1 > amount1Max) revert SlippageExceeded();
+
+        emit Deposit(id, msg.sender, liquidity, amount0, amount1);
+    }
+
+    /// @notice Remove liquidity. While a seat is held, WITHDRAW_FEE of both amounts goes to the holder.
+    function removeLiquidity(
+        PoolKey calldata key,
+        uint128 liquidity,
+        uint256 amount0Min,
+        uint256 amount1Min,
+        uint160 sqrtPriceMinX96,
+        uint160 sqrtPriceMaxX96
+    ) external nonReentrant returns (uint256 amount0, uint256 amount1) {
+        PoolId id = key.toId();
+        Pool storage pool = _registered(id);
+        if (liquidity == 0) revert ZeroLiquidity();
+        _checkPrice(id, sqrtPriceMinX96, sqrtPriceMaxX96);
+
+        _updateAmAmmWrite(id);
+        Position storage pos = positions[id][msg.sender];
+        if (pos.liquidity < liquidity) revert InsufficientLiquidity();
+        _accrue(pool, pos);
+        pos.liquidity -= liquidity;
+        pool.liquidity -= liquidity;
+
+        address holder = _topBids[id].manager;
+        uint24 withdrawFee = holder == address(0) ? 0 : WITHDRAW_FEE;
+        uint256 fee0;
+        uint256 fee1;
+        (amount0, amount1, fee0, fee1) = abi.decode(
+            poolManager.unlock(abi.encode(Action.Remove, abi.encode(key, msg.sender, liquidity, withdrawFee))),
+            (uint256, uint256, uint256, uint256)
+        );
+        if (amount0 < amount0Min || amount1 < amount1Min) revert SlippageExceeded();
+        if (fee0 != 0) _accrueFees(holder, key.currency0, fee0);
+        if (fee1 != 0) _accrueFees(holder, key.currency1, fee1);
+
+        emit Withdraw(id, msg.sender, liquidity, amount0, amount1, fee0, fee1);
+    }
+
+    /// @notice Pay out the caller's rent and no-seat swap fees for a pool.
+    function collect(PoolKey calldata key, address recipient)
+        external
+        nonReentrant
+        returns (uint256 amount0, uint256 amount1)
+    {
+        PoolId id = key.toId();
+        Pool storage pool = _registered(id);
+        _updateAmAmmWrite(id);
+        Position storage pos = positions[id][msg.sender];
+        _accrue(pool, pos);
+        (amount0, amount1) = (pos.owed0, pos.owed1);
+        pos.owed0 = 0;
+        pos.owed1 = 0;
+        if (amount0 != 0) _transfer(key.currency0, recipient, amount0);
+        if (amount1 != 0) _transfer(key.currency1, recipient, amount1);
+        emit Collect(id, msg.sender, amount0, amount1);
+    }
+
+    /// @notice What `collect` would pay the owner now, including rent not yet charged.
