@@ -143,3 +143,58 @@ contract Landlord is AmAmm, IHooks, IUnlockCallback {
     modifier onlyPoolManager() {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
         _;
+    }
+
+    /// @dev Transient-storage lock on every external entry point that moves tokens.
+    modifier nonReentrant() {
+        bool locked;
+        assembly ("memory-safe") {
+            locked := tload(0)
+        }
+        if (locked) revert Reentrancy();
+        assembly ("memory-safe") {
+            tstore(0, 1)
+        }
+        _;
+        assembly ("memory-safe") {
+            tstore(0, 0)
+        }
+    }
+
+    /// @param burnPoolKey_ A plain v4 pool (no hook, static fee of at least 0.3%) pairing `quote_`
+    /// with `burnToken_`. Must be initialized before the first crank.
+    constructor(IPoolManager poolManager_, Currency quote_, Currency burnToken_, PoolKey memory burnPoolKey_) {
+        bool pairOk = (burnPoolKey_.currency0 == quote_ && burnPoolKey_.currency1 == burnToken_)
+            || (burnPoolKey_.currency1 == quote_ && burnPoolKey_.currency0 == burnToken_);
+        if (
+            !pairOk || address(burnPoolKey_.hooks) != address(0) || burnPoolKey_.fee < 3000
+                || LPFeeLibrary.isDynamicFee(burnPoolKey_.fee) || quote_.isAddressZero() || burnToken_.isAddressZero()
+        ) revert InvalidBurnPool();
+
+        Hooks.validateHookPermissions(
+            this,
+            Hooks.Permissions({
+                beforeInitialize: true,
+                afterInitialize: false,
+                beforeAddLiquidity: true,
+                afterAddLiquidity: false,
+                beforeRemoveLiquidity: true,
+                afterRemoveLiquidity: false,
+                beforeSwap: false,
+                afterSwap: true,
+                beforeDonate: true,
+                afterDonate: false,
+                beforeSwapReturnDelta: false,
+                afterSwapReturnDelta: true,
+                afterAddLiquidityReturnDelta: false,
+                afterRemoveLiquidityReturnDelta: false
+            })
+        );
+        poolManager = poolManager_;
+        quote = quote_;
+        burnToken = burnToken_;
+        burnCurrency0 = burnPoolKey_.currency0;
+        burnCurrency1 = burnPoolKey_.currency1;
+        burnFee = burnPoolKey_.fee;
+        burnTickSpacing = burnPoolKey_.tickSpacing;
+    }
