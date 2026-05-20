@@ -288,3 +288,93 @@ contract Landlord is AmAmm, IHooks, IUnlockCallback {
     }
 
     /// @notice What `collect` would pay the owner now, including rent not yet charged.
+    function owed(PoolKey calldata key, address owner) external view returns (uint256 amount0, uint256 amount1) {
+        PoolId id = key.toId();
+        Pool memory pool = pools[id];
+        Position memory pos = positions[id][owner];
+        uint256 pendingRent = _pendingRent(id);
+        if (pool.liquidity != 0 && pendingRent != 0) {
+            pool.rentPerLiquidityX128 += FullMath.mulDiv(pendingRent - _burnPart(pendingRent), Q128, pool.liquidity);
+        }
+        uint256 rent = FullMath.mulDiv(pos.liquidity, pool.rentPerLiquidityX128 - pos.rentCheckpointX128, Q128);
+        amount0 = pos.owed0 + FullMath.mulDiv(pos.liquidity, pool.fee0PerLiquidityX128 - pos.fee0CheckpointX128, Q128);
+        amount1 = pos.owed1 + FullMath.mulDiv(pos.liquidity, pool.fee1PerLiquidityX128 - pos.fee1CheckpointX128, Q128);
+        if (pool.quoteIs0) amount0 += rent;
+        else amount1 += rent;
+    }
+
+    /// @notice Lowest rent a bid can name now, in quote units per block.
+    function minRent(PoolId id) external view returns (uint128) {
+        return _minRent(id);
+    }
+
+    /// @notice The swap fee a non-holder pays right now, in pips.
+    function currentFee(PoolId id) external view returns (uint24) {
+        (Bid memory topBid,) = _updateAmAmmView(id);
+        return topBid.manager == address(0) ? DEFAULT_FEE : _feeAt(topBid, _blockIdx());
+    }
+
+    // ---------------------------------------------------------------------
+    // Burn
+    // ---------------------------------------------------------------------
+
+    /// @notice Anyone can call: spends burn-share rent on the burn token in the burn pool and sends
+    /// every unit bought to 0xdEaD. At most once per block and at most BURN_MAX_DEPTH of the pool's
+    /// in-range quote depth per call.
+    function crankBurn() external nonReentrant returns (uint256 spent, uint256 burned) {
+        uint256 blockNumber = _blockNumber();
+        if (lastBurnBlock == blockNumber) revert BurnAlreadyCrankedThisBlock();
+        PoolKey memory key = burnPoolKey();
+        PoolId id = key.toId();
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(id);
+        uint128 depth = poolManager.getLiquidity(id);
+        if (sqrtPriceX96 == 0 || depth == 0) revert InvalidBurnPool();
+
+        bool quoteIs0 = key.currency0 == quote;
+        uint256 quoteDepth = quoteIs0
+            ? FullMath.mulDiv(depth, FixedPoint96.Q96, sqrtPriceX96)
+            : FullMath.mulDiv(depth, sqrtPriceX96, FixedPoint96.Q96);
+        uint256 amountIn = burnBucket;
+        uint256 cap = quoteDepth * BURN_MAX_DEPTH / PIPS;
+        if (amountIn > cap) amountIn = cap;
+        if (amountIn == 0) revert NothingToBurn();
+
+        lastBurnBlock = blockNumber;
+        (spent, burned) = abi.decode(
+            poolManager.unlock(abi.encode(Action.Burn, abi.encode(key, quoteIs0, amountIn))), (uint256, uint256)
+        );
+        burnBucket -= spent;
+        totalBurnSpent += spent;
+        totalBurned += burned;
+        emit Burn(msg.sender, spent, burned);
+    }
+
+    function burnPoolKey() public view returns (PoolKey memory) {
+        return PoolKey(burnCurrency0, burnCurrency1, burnFee, burnTickSpacing, IHooks(address(0)));
+    }
+
+    // ---------------------------------------------------------------------
+    // PoolManager callbacks
+    // ---------------------------------------------------------------------
+
+    function unlockCallback(bytes calldata data) external onlyPoolManager returns (bytes memory) {
+        (Action action, bytes memory args) = abi.decode(data, (Action, bytes));
+        if (action == Action.Add) {
+            (PoolKey memory key, address payer, uint128 liquidity) = abi.decode(args, (PoolKey, address, uint128));
+            // the position never earns v4 fees (LP fee 0, donations refused), so the fee delta is empty
+            (BalanceDelta delta,) = poolManager.modifyLiquidity(key, _fullRange(int256(uint256(liquidity))), "");
+            uint256 amount0 = uint256(int256(-delta.amount0()));
+            uint256 amount1 = uint256(int256(-delta.amount1()));
+            _settleFrom(key.currency0, payer, amount0);
+            _settleFrom(key.currency1, payer, amount1);
+            return abi.encode(amount0, amount1);
+        } else if (action == Action.Remove) {
+            (PoolKey memory key, address recipient, uint128 liquidity, uint24 withdrawFee) =
+                abi.decode(args, (PoolKey, address, uint128, uint24));
+            (BalanceDelta delta,) = poolManager.modifyLiquidity(key, _fullRange(-int256(uint256(liquidity))), "");
+            uint256 total0 = uint256(int256(delta.amount0()));
+            uint256 total1 = uint256(int256(delta.amount1()));
+            uint256 fee0 = total0 * withdrawFee / PIPS;
+            uint256 fee1 = total1 * withdrawFee / PIPS;
+            _takeSplit(key.currency0, recipient, total0, fee0);
+            _takeSplit(key.currency1, recipient, total1, fee1);
