@@ -378,3 +378,83 @@ contract Landlord is AmAmm, IHooks, IUnlockCallback {
             uint256 fee1 = total1 * withdrawFee / PIPS;
             _takeSplit(key.currency0, recipient, total0, fee0);
             _takeSplit(key.currency1, recipient, total1, fee1);
+            return abi.encode(total0 - fee0, total1 - fee1, fee0, fee1);
+        } else {
+            (PoolKey memory key, bool quoteIs0, uint256 amountIn) = abi.decode(args, (PoolKey, bool, uint256));
+            (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(key.toId());
+            // a price limit 2% away keeps one crank inside the pool's range even if depth is thin
+            uint256 limit = quoteIs0 ? uint256(sqrtPriceX96) * 990 / 1000 : uint256(sqrtPriceX96) * 1010 / 1000;
+            if (limit <= TickMath.MIN_SQRT_PRICE) limit = TickMath.MIN_SQRT_PRICE + 1;
+            if (limit >= TickMath.MAX_SQRT_PRICE) limit = TickMath.MAX_SQRT_PRICE - 1;
+            BalanceDelta delta = poolManager.swap(
+                key,
+                SwapParams({
+                    zeroForOne: quoteIs0, amountSpecified: -amountIn.toInt256(), sqrtPriceLimitX96: limit.toUint160()
+                }),
+                ""
+            );
+            (int128 paid, int128 got) =
+                quoteIs0 ? (delta.amount0(), delta.amount1()) : (delta.amount1(), delta.amount0());
+            // a swap stopped by the price limit spends less than amountIn; the rest stays in the bucket
+            uint256 quotePaid = (-paid).toUint128();
+            uint256 bought = got.toUint128();
+            _settleFrom(quote, address(this), quotePaid);
+            poolManager.take(burnToken, DEAD, bought);
+            return abi.encode(quotePaid, bought);
+        }
+    }
+
+    function beforeInitialize(address, PoolKey calldata key, uint160) external onlyPoolManager returns (bytes4) {
+        // One pool per pair: the hook, fee and tick spacing are fixed, so a pair has exactly one PoolId.
+        bool quoteIs0 = key.currency0 == quote;
+        if (
+            address(key.hooks) != address(this) || key.fee != 0 || key.tickSpacing != TICK_SPACING
+                || (!quoteIs0 && !(key.currency1 == quote)) || key.currency0.isAddressZero()
+        ) revert InvalidPoolKey();
+        Pool storage pool = pools[key.toId()];
+        pool.registered = true;
+        pool.quoteIs0 = quoteIs0;
+        return IHooks.beforeInitialize.selector;
+    }
+
+    /// @dev The PoolManager skips hook calls for the hook's own modifyLiquidity, so reaching here
+    /// means someone else is trying to provide liquidity outside the share books.
+    function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
+        external
+        view
+        onlyPoolManager
+        returns (bytes4)
+    {
+        revert LiquidityOnlyThroughHook();
+    }
+
+    function beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
+        external
+        view
+        onlyPoolManager
+        returns (bytes4)
+    {
+        revert LiquidityOnlyThroughHook();
+    }
+
+    /// @dev A donation would land in the hook's position as v4 fee growth, outside the share books.
+    function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata)
+        external
+        view
+        onlyPoolManager
+        returns (bytes4)
+    {
+        revert DonationsDisabled();
+    }
+
+    /// @dev The pool's LP fee is 0; the swap fee is taken here on the unspecified side (output of an
+    /// exact-in swap, input of an exact-out swap). The holder's own swaps pay nothing.
+    function afterSwap(
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        BalanceDelta delta,
+        bytes calldata
+    ) external onlyPoolManager returns (bytes4, int128) {
+        PoolId id = key.toId();
+        _updateAmAmmWrite(id);
