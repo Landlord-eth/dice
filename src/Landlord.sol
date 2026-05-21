@@ -458,3 +458,83 @@ contract Landlord is AmAmm, IHooks, IUnlockCallback {
     ) external onlyPoolManager returns (bytes4, int128) {
         PoolId id = key.toId();
         _updateAmAmmWrite(id);
+
+        Bid memory topBid = _topBids[id];
+        uint24 fee = topBid.manager == address(0) ? DEFAULT_FEE : _feeAt(topBid, _blockIdx());
+        if (sender == topBid.manager || fee == 0) return (IHooks.afterSwap.selector, 0);
+
+        bool specifiedIs0 = (params.amountSpecified < 0) == params.zeroForOne;
+        (Currency feeCurrency, int128 unspecified) =
+            specifiedIs0 ? (key.currency1, delta.amount1()) : (key.currency0, delta.amount0());
+        if (unspecified < 0) unspecified = -unspecified;
+        uint256 feeAmount = uint256(unspecified.toUint128()) * fee / PIPS;
+        if (feeAmount == 0) return (IHooks.afterSwap.selector, 0);
+
+        if (topBid.manager != address(0)) {
+            _accrueFees(topBid.manager, feeCurrency, feeAmount);
+        } else {
+            // a nonzero fee implies a nonzero swap, so the pool holds liquidity
+            Pool storage pool = pools[id];
+            uint256 perLiquidity = FullMath.mulDiv(feeAmount, Q128, pool.liquidity);
+            if (feeCurrency == key.currency0) pool.fee0PerLiquidityX128 += perLiquidity;
+            else pool.fee1PerLiquidityX128 += perLiquidity;
+        }
+        emit SwapFee(id, topBid.manager, feeCurrency, feeAmount);
+        poolManager.take(feeCurrency, address(this), feeAmount);
+        return (IHooks.afterSwap.selector, feeAmount.toInt128());
+    }
+
+    // Permissions not granted to this hook; the PoolManager never calls these.
+    function afterInitialize(address, PoolKey calldata, uint160, int24) external pure returns (bytes4) {
+        revert HookNotImplemented();
+    }
+
+    function afterAddLiquidity(
+        address,
+        PoolKey calldata,
+        ModifyLiquidityParams calldata,
+        BalanceDelta,
+        BalanceDelta,
+        bytes calldata
+    ) external pure returns (bytes4, BalanceDelta) {
+        revert HookNotImplemented();
+    }
+
+    function afterRemoveLiquidity(
+        address,
+        PoolKey calldata,
+        ModifyLiquidityParams calldata,
+        BalanceDelta,
+        BalanceDelta,
+        bytes calldata
+    ) external pure returns (bytes4, BalanceDelta) {
+        revert HookNotImplemented();
+    }
+
+    function beforeSwap(address, PoolKey calldata, SwapParams calldata, bytes calldata)
+        external
+        pure
+        returns (bytes4, BeforeSwapDelta, uint24)
+    {
+        revert HookNotImplemented();
+    }
+
+    function afterDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external pure returns (bytes4) {
+        revert HookNotImplemented();
+    }
+
+    // ---------------------------------------------------------------------
+    // AmAmm wiring
+    // ---------------------------------------------------------------------
+
+    function bid(PoolId id, address manager, uint24 fee, uint128 rent, uint128 deposit) public override nonReentrant {
+        super.bid(id, manager, fee, rent, deposit);
+    }
+
+    function depositIntoBid(PoolId id, uint128 amount, bool isTopBid) public override nonReentrant {
+        super.depositIntoBid(id, amount, isTopBid);
+    }
+
+    function withdrawFromBid(PoolId id, uint128 amount, address recipient, bool isTopBid) public override nonReentrant {
+        super.withdrawFromBid(id, amount, recipient, isTopBid);
+    }
