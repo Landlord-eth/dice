@@ -538,3 +538,63 @@ contract Landlord is AmAmm, IHooks, IUnlockCallback {
     function withdrawFromBid(PoolId id, uint128 amount, address recipient, bool isTopBid) public override nonReentrant {
         super.withdrawFromBid(id, amount, recipient, isTopBid);
     }
+
+    function claimRefund(PoolId id, address recipient) public override nonReentrant returns (uint256) {
+        return super.claimRefund(id, recipient);
+    }
+
+    function claimFees(Currency currency, address recipient) public override nonReentrant returns (uint256) {
+        return super.claimFees(currency, recipient);
+    }
+
+    function _amAmmEnabled(PoolId id) internal view override returns (bool) {
+        return pools[id].registered;
+    }
+
+    /// @dev 1% a year of the pool's value (twice its quote side at the current price) per block.
+    function _minRent(PoolId id) internal view override returns (uint128) {
+        Pool storage pool = pools[id];
+        if (pool.liquidity == 0) return 1;
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(id);
+        uint256 quoteSide = pool.quoteIs0
+            ? FullMath.mulDiv(pool.liquidity, FixedPoint96.Q96, sqrtPriceX96)
+            : FullMath.mulDiv(pool.liquidity, sqrtPriceX96, FixedPoint96.Q96);
+        uint256 rent = 2 * quoteSide * MIN_RENT_PER_YEAR_PIPS / PIPS / BLOCKS_PER_YEAR;
+        return rent == 0 ? 1 : rent.toUint128();
+    }
+
+    function _chargeRent(PoolId id, uint256 amount) internal override {
+        Pool storage pool = pools[id];
+        uint256 toBurn = _burnPart(amount);
+        if (pool.liquidity == 0) toBurn = amount;
+        uint256 toLps = amount - toBurn;
+        if (toLps != 0) pool.rentPerLiquidityX128 += FullMath.mulDiv(toLps, Q128, pool.liquidity);
+        burnBucket += toBurn;
+        emit RentCharged(id, toLps, toBurn);
+    }
+
+    function _pullBidToken(address from, uint256 amount) internal override {
+        ERC20(Currency.unwrap(quote)).safeTransferFrom(from, address(this), amount);
+    }
+
+    function _pushBidToken(address to, uint256 amount) internal override {
+        _transfer(quote, to, amount);
+    }
+
+    function _transferFeeToken(Currency currency, address to, uint256 amount) internal override {
+        _transfer(currency, to, amount);
+    }
+
+    // ---------------------------------------------------------------------
+    // Internal
+    // ---------------------------------------------------------------------
+
+    function _registered(PoolId id) private view returns (Pool storage pool) {
+        pool = pools[id];
+        if (!pool.registered) revert PoolNotRegistered();
+    }
+
+    function _checkPrice(PoolId id, uint160 minX96, uint160 maxX96) private view {
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(id);
+        if (sqrtPriceX96 < minX96 || sqrtPriceX96 > maxX96) revert PriceOutOfBounds();
+    }
