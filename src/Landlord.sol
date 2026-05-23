@@ -598,3 +598,70 @@ contract Landlord is AmAmm, IHooks, IUnlockCallback {
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(id);
         if (sqrtPriceX96 < minX96 || sqrtPriceX96 > maxX96) revert PriceOutOfBounds();
     }
+
+    /// @dev Books everything the position earned since its last checkpoint. Callers run
+    /// `_updateAmAmmWrite` first, so rent for blocks before a liquidity change is credited to the
+    /// liquidity that was there during those blocks.
+    function _accrue(Pool storage pool, Position storage pos) private {
+        uint128 liquidity = pos.liquidity;
+        if (liquidity != 0) {
+            uint256 rent = FullMath.mulDiv(liquidity, pool.rentPerLiquidityX128 - pos.rentCheckpointX128, Q128);
+            uint256 fee0 = FullMath.mulDiv(liquidity, pool.fee0PerLiquidityX128 - pos.fee0CheckpointX128, Q128);
+            uint256 fee1 = FullMath.mulDiv(liquidity, pool.fee1PerLiquidityX128 - pos.fee1CheckpointX128, Q128);
+            if (pool.quoteIs0) fee0 += rent;
+            else fee1 += rent;
+            pos.owed0 += fee0;
+            pos.owed1 += fee1;
+        }
+        pos.rentCheckpointX128 = pool.rentPerLiquidityX128;
+        pos.fee0CheckpointX128 = pool.fee0PerLiquidityX128;
+        pos.fee1CheckpointX128 = pool.fee1PerLiquidityX128;
+    }
+
+    function _pendingRent(PoolId id) private view returns (uint256 rent) {
+        uint48 currentBlockIdx = _blockIdx();
+        if (_lastUpdatedBlockIdx[id] == currentBlockIdx) return 0;
+        Bid memory topBid = _topBids[id];
+        Bid memory nextBid = _nextBids[id];
+        while (true) {
+            (Bid memory t, Bid memory n, bool ut, bool un, uint256 r,,) =
+                _stateTransition(currentBlockIdx, topBid, nextBid);
+            if (!ut && !un) break;
+            (topBid, nextBid) = (t, n);
+            rent += r;
+        }
+    }
+
+    function _burnPart(uint256 rent) private pure returns (uint256) {
+        return rent * BURN_SHARE / PIPS;
+    }
+
+    function _fullRange(int256 liquidityDelta) private pure returns (ModifyLiquidityParams memory) {
+        return ModifyLiquidityParams({
+            tickLower: TickMath.minUsableTick(TICK_SPACING),
+            tickUpper: TickMath.maxUsableTick(TICK_SPACING),
+            liquidityDelta: liquidityDelta,
+            salt: bytes32(0)
+        });
+    }
+
+    function _settleFrom(Currency currency, address payer, uint256 amount) private {
+        if (amount == 0) return;
+        poolManager.sync(currency);
+        if (payer == address(this)) {
+            ERC20(Currency.unwrap(currency)).safeTransfer(address(poolManager), amount);
+        } else {
+            ERC20(Currency.unwrap(currency)).safeTransferFrom(payer, address(poolManager), amount);
+        }
+        poolManager.settle();
+    }
+
+    function _takeSplit(Currency currency, address recipient, uint256 total, uint256 fee) private {
+        if (total - fee != 0) poolManager.take(currency, recipient, total - fee);
+        if (fee != 0) poolManager.take(currency, address(this), fee);
+    }
+
+    function _transfer(Currency currency, address to, uint256 amount) private {
+        ERC20(Currency.unwrap(currency)).safeTransfer(to, amount);
+    }
+}
