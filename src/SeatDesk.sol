@@ -73,3 +73,74 @@ contract SeatDesk is IUnlockCallback {
         return hook.claimRefund(id, owner);
     }
 
+    function claimFees(Currency currency) external onlyOwner returns (uint256) {
+        return hook.claimFees(currency, owner);
+    }
+
+    // ---------------------------------------------------------------------
+    // Fee-free swap
+    // ---------------------------------------------------------------------
+
+    /// @notice Exact-in swap straight on the PoolManager, from and to the owner's wallet (the owner
+    /// approves this desk for the input token). Only LANDLORD pools: a pool with another hook could
+    /// charge the swapper more than `amountIn` through a hook delta, and the desk pays from the
+    /// owner's approval.
+    function swap(PoolKey calldata key, bool zeroForOne, uint128 amountIn, uint256 minOut)
+        external
+        onlyOwner
+        returns (uint256 out)
+    {
+        if (address(key.hooks) != address(hook)) revert NotLandlordPool();
+        out = abi.decode(poolManager.unlock(abi.encode(key, zeroForOne, amountIn)), (uint256));
+        if (out < minOut) revert TooLittleReceived();
+    }
+
+    /// @dev Reached only from `swap`: the PoolManager calls back the contract that unlocked it.
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        if (msg.sender != address(poolManager)) revert NotPoolManager();
+        (PoolKey memory key, bool zeroForOne, uint128 amountIn) = abi.decode(data, (PoolKey, bool, uint128));
+        BalanceDelta delta = poolManager.swap(
+            key,
+            SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: -int256(uint256(amountIn)),
+                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            ""
+        );
+        (Currency cin, Currency cout) = zeroForOne ? (key.currency0, key.currency1) : (key.currency1, key.currency0);
+        uint256 paid = (zeroForOne ? -delta.amount0() : -delta.amount1()).toUint128();
+        uint256 got = (zeroForOne ? delta.amount1() : delta.amount0()).toUint128();
+        if (paid > amountIn) revert OverPaid();
+
+        poolManager.sync(cin);
+        ERC20(Currency.unwrap(cin)).safeTransferFrom(owner, address(poolManager), paid);
+        poolManager.settle();
+        poolManager.take(cout, owner, got);
+        return abi.encode(got);
+    }
+}
+
+/// @notice One desk per wallet, at an address the app can compute before it exists. Deployed once,
+/// next to the hook.
+contract SeatDeskFactory {
+    event DeskOpened(address indexed owner, address desk);
+
+    IPoolManager public immutable poolManager;
+    Landlord public immutable hook;
+    mapping(address => address) public deskOf;
+
+    constructor(IPoolManager poolManager_, Landlord hook_) {
+        poolManager = poolManager_;
+        hook = hook_;
+    }
+
+    /// @notice Opens the caller's desk, or returns it if it exists. Nobody can open one for someone else.
+    function open() external returns (address desk) {
+        desk = deskOf[msg.sender];
+        if (desk != address(0)) return desk;
+        desk = address(new SeatDesk{salt: bytes32(uint256(uint160(msg.sender)))}(poolManager, hook, msg.sender));
+        deskOf[msg.sender] = desk;
+        emit DeskOpened(msg.sender, desk);
+    }
+}
