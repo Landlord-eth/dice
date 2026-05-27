@@ -63,3 +63,63 @@ contract AmAmmTest is Test {
         for (uint256 b; b < 3 * uint256(K); ++b) {
             vm.roll(vm.getBlockNumber() + 1);
             eager.updateStateMachine(ID);
+        }
+        lazy.updateStateMachine(ID);
+        _check();
+    }
+
+    function _check() internal {
+        AmAmm.Bid memory te = eager.getBid(ID, true);
+        AmAmm.Bid memory tl = lazy.getBid(ID, true);
+        AmAmm.Bid memory ne = eager.getBid(ID, false);
+        AmAmm.Bid memory nl = lazy.getBid(ID, false);
+        assertEq(te.manager, tl.manager, "seat holder");
+        assertEq(te.rent, tl.rent, "seat rent");
+        assertEq(te.deposit, tl.deposit, "seat deposit");
+        assertEq(ne.manager, nl.manager, "queued bidder");
+        assertEq(ne.deposit, nl.deposit, "queued deposit");
+        lazy.updateStateMachine(ID);
+        assertEq(eager.totalRentCharged(), lazy.totalRentCharged(), "rent charged");
+        for (uint256 i; i < 3; ++i) {
+            assertEq(eager.refundOf(bidders[i], ID), lazy.refundOf(bidders[i], ID), "refunds");
+        }
+        // solvency: everything the auction holds is a deposit, a refund or charged rent
+        for (uint256 i; i < 2; ++i) {
+            AmAmmHarness h = i == 0 ? eager : lazy;
+            assertEq(
+                token.balanceOf(address(h)),
+                h.topBid(ID).deposit + h.nextBid(ID).deposit + _refundSum(h) + h.totalRentCharged(),
+                "auction balance"
+            );
+        }
+    }
+
+    function _refundSum(AmAmmHarness h) internal view returns (uint256 s) {
+        for (uint256 i; i < 3; ++i) s += h.refundOf(bidders[i], ID);
+    }
+
+    // -----------------------------------------------------------------
+    // BidDog rules, one by one
+    // -----------------------------------------------------------------
+
+    function test_bidTakesSeatExactlyKBlocksLater() public {
+        _bid(eager, bidders[0], 1000, 1000 * K);
+        vm.roll(vm.getBlockNumber() + K - 1);
+        assertEq(eager.getBid(ID, true).manager, address(0));
+        vm.roll(vm.getBlockNumber() + 1);
+        assertEq(eager.getBid(ID, true).manager, bidders[0]);
+    }
+
+    function test_raiseMustBeatQueueByTenPercent() public {
+        _bid(eager, bidders[0], 1000, 1000 * K);
+        vm.prank(bidders[1]);
+        vm.expectRevert(AmAmm.AmAmm__InvalidBid.selector);
+        eager.bid(ID, bidders[1], 3000, 1100, 1100 * K);
+        _bid(eager, bidders[1], 1101, 1101 * K);
+        assertEq(eager.refundOf(bidders[0], ID), 1000 * uint256(K), "outbid queue refunded in full");
+    }
+
+    function test_depositRulesAndFeeCap() public {
+        vm.startPrank(bidders[0]);
+        vm.expectRevert(AmAmm.AmAmm__InvalidBid.selector);
+        eager.bid(ID, bidders[0], 3000, 1000, 1000 * K - 1000); // under K blocks of rent
