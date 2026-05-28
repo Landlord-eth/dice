@@ -123,3 +123,63 @@ contract AmAmmTest is Test {
         vm.startPrank(bidders[0]);
         vm.expectRevert(AmAmm.AmAmm__InvalidBid.selector);
         eager.bid(ID, bidders[0], 3000, 1000, 1000 * K - 1000); // under K blocks of rent
+        vm.expectRevert(AmAmm.AmAmm__InvalidBid.selector);
+        eager.bid(ID, bidders[0], 3000, 1000, 1000 * K + 1); // not a multiple of rent
+        vm.expectRevert(AmAmm.AmAmm__InvalidBid.selector);
+        eager.bid(ID, bidders[0], 10_001, 1000, 1000 * K); // fee above 1%
+        vm.expectRevert(AmAmm.AmAmm__InvalidBid.selector);
+        eager.bid(ID, address(0), 3000, 1000, 1000 * K);
+        vm.stopPrank();
+    }
+
+    function test_holderCannotLeaveWithLessThanKBlocksOfRent() public {
+        _bid(eager, bidders[0], 1000, 3000 * K);
+        vm.roll(vm.getBlockNumber() + K);
+        vm.startPrank(bidders[0]);
+        eager.withdrawFromBid(ID, 1000 * K, bidders[0], true); // leaves 2K blocks
+        vm.expectRevert(AmAmm.AmAmm__BidLocked.selector);
+        eager.withdrawFromBid(ID, 1000 * (K + 1), bidders[0], true); // would leave K - 1 blocks
+        vm.stopPrank();
+    }
+
+    function test_lowerQueuedBidWaitsForSeatToRunDry() public {
+        _bid(eager, bidders[0], 1000, 2000 * K); // runs dry 2K blocks after it starts
+        vm.roll(vm.getBlockNumber() + K);
+        _bid(eager, bidders[1], 1050, 1050 * K); // not 10% better: waits
+        vm.roll(vm.getBlockNumber() + K + 10);
+        assertEq(eager.getBid(ID, true).manager, bidders[0], "holder keeps the seat");
+        vm.roll(vm.getBlockNumber() + K);
+        eager.updateStateMachine(ID);
+        AmAmm.Bid memory top = eager.topBid(ID);
+        assertEq(top.manager, bidders[1], "queued bid starts when the holder runs dry");
+        assertEq(eager.totalRentCharged(), 1000 * 2 * uint256(K) + 1050 * 10, "no unpaid gap");
+    }
+
+    function test_onlyOwnerOfBidCanTouchIt() public {
+        _bid(eager, bidders[0], 1000, 2000 * K);
+        vm.startPrank(bidders[1]);
+        vm.expectRevert(AmAmm.AmAmm__Unauthorized.selector);
+        eager.withdrawFromBid(ID, 1000, bidders[1], false);
+        vm.expectRevert(AmAmm.AmAmm__Unauthorized.selector);
+        eager.depositIntoBid(ID, 1000, false);
+        vm.expectRevert(AmAmm.AmAmm__Unauthorized.selector);
+        eager.setBidFee(ID, 1, false);
+        vm.stopPrank();
+    }
+
+    function test_feeChangeAppliesFromNextBlock() public {
+        _bid(eager, bidders[0], 1000, 2000 * K);
+        vm.roll(vm.getBlockNumber() + K);
+        vm.prank(bidders[0]);
+        eager.setBidFee(ID, 7000, true);
+        AmAmm.Bid memory top = eager.topBid(ID);
+        assertEq(top.prevFee, 3000);
+        assertEq(top.fee, 7000);
+        assertEq(top.feeBlockIdx, uint48(vm.getBlockNumber() - 1)); // harness deployed at block 1
+    }
+
+    function _bid(AmAmmHarness h, address who, uint128 rent, uint128 deposit) internal {
+        vm.prank(who);
+        h.bid(ID, who, 3000, rent, deposit);
+    }
+}
