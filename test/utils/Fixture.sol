@@ -128,3 +128,130 @@ abstract contract Fixture is Test {
     address lp2 = makeAddr("lp2");
     address trader = makeAddr("trader");
     address agentOwner = makeAddr("agentOwner");
+    address rivalOwner = makeAddr("rivalOwner");
+
+    function setUp() public virtual {
+        vm.createSelectFork(vm.envOr("FORK_URL", string("hood")), vm.envUint("FORK_BLOCK"));
+
+        vm.etch(address(100), type(MockArbSys).runtimeCode);
+        router = new PoolSwapTest(PM);
+        liqRouter = new PoolModifyLiquidityTest(PM);
+
+        standIn = new MockERC20("LANDLORD stand-in", "LLDX", 18);
+        burnKey = _sorted(USDG, address(standIn), 3000, 60, address(0));
+        // stand-in at $0.01: 1 LLDX (1e18) = 0.01 USDG (1e4) -> raw price token1/token0
+        PM.initialize(burnKey, _sqrtPrice(burnKey, address(standIn), 1e4, 1e18));
+        _fund(address(this), 10_000_000e6, 0);
+        standIn.mint(address(this), 1e30);
+        ERC20(USDG).approve(address(liqRouter), type(uint256).max);
+        standIn.approve(address(liqRouter), type(uint256).max);
+        liqRouter.modifyLiquidity(
+            burnKey,
+            ModifyLiquidityParams(TickMath.minUsableTick(60), TickMath.maxUsableTick(60), 1e17, bytes32(0)),
+            ""
+        );
+
+        // a fixed flagged address keeps every pool id, and so the cached fork state, the same across
+        // code changes; test_deploysThroughCreate2 covers the real salt-mined deployment
+        address at = address(
+            (uint160(uint256(keccak256("LANDLORD"))) & ~Hooks.ALL_HOOK_MASK) | HookAddress.FLAGS
+        );
+        deployCodeTo(
+            "Landlord.sol:Landlord", abi.encode(PM, Currency.wrap(USDG), Currency.wrap(address(standIn)), burnKey), at
+        );
+        hook = Landlord(at);
+
+        key = _sorted(SPCX, USDG, 0, 60, address(hook));
+        id = key.toId();
+        (startPrice,,,) = PM.getSlot0(REF_POOL);
+        PM.initialize(key, startPrice);
+        _touchBitmap(id);
+        _touchBitmap(burnKey.toId());
+
+        address[5] memory actors = [lp1, lp2, trader, agentOwner, rivalOwner];
+        for (uint256 i; i < actors.length; ++i) {
+            _fund(actors[i], 5_000_000e6, 10_000e18);
+            vm.startPrank(actors[i]);
+            ERC20(USDG).approve(address(hook), type(uint256).max);
+            ERC20(SPCX).approve(address(hook), type(uint256).max);
+            ERC20(USDG).approve(address(router), type(uint256).max);
+            ERC20(SPCX).approve(address(router), type(uint256).max);
+            vm.stopPrank();
+        }
+    }
+
+    // ---------------------------------------------------------------------
+
+    /// @dev Reads every tick-bitmap word of a tick-spacing-60 pool once, so a fresh run caches the
+    /// words any later swap can reach and the pinned replay never asks the RPC for state.
+    function _touchBitmap(PoolId pid) internal view {
+        for (int16 w = -61; w <= 61; ++w) PM.getTickBitmap(pid, w);
+    }
+
+    function _fund(address who, uint256 usdg, uint256 spcx) internal {
+        if (usdg != 0) deal(USDG, who, ERC20(USDG).balanceOf(who) + usdg);
+        if (spcx != 0) deal(SPCX, who, ERC20(SPCX).balanceOf(who) + spcx);
+    }
+
+    function _sorted(address a, address b, uint24 fee, int24 spacing, address hooks) internal pure returns (PoolKey memory) {
+        (address c0, address c1) = a < b ? (a, b) : (b, a);
+        return PoolKey(Currency.wrap(c0), Currency.wrap(c1), fee, spacing, IHooks(hooks));
+    }
+
+    /// @dev sqrtPriceX96 for "amountBase of base is worth amountOther of the other token".
+    function _sqrtPrice(PoolKey memory k, address base, uint256 amountOther, uint256 amountBase)
+        internal
+        pure
+        returns (uint160)
+    {
+        bool baseIs0 = Currency.unwrap(k.currency0) == base;
+        (uint256 num, uint256 den) = baseIs0 ? (amountOther, amountBase) : (amountBase, amountOther);
+        return uint160(_sqrt((num << 192) / den));
+    }
+
+    function _sqrt(uint256 x) internal pure returns (uint256 z) {
+        if (x == 0) return 0;
+        z = x;
+        uint256 y = (x >> 1) + 1;
+        while (y < z) (z, y) = (y, (x / y + y) >> 1);
+    }
+
+    function _add(address who, uint128 liquidity) internal returns (uint256 a0, uint256 a1) {
+        vm.prank(who);
+        (a0, a1) = hook.addLiquidity(key, liquidity, type(uint256).max, type(uint256).max, 0, type(uint160).max);
+    }
+
+    function _remove(address who, uint128 liquidity) internal returns (uint256 a0, uint256 a1) {
+        vm.prank(who);
+        (a0, a1) = hook.removeLiquidity(key, liquidity, 0, 0, 0, type(uint160).max);
+    }
+
+    /// @dev Exact-in swap by `who` through the public test router (sender = router, so it pays the fee).
+    function _swap(address who, bool zeroForOne, uint256 amountIn) internal returns (BalanceDelta d) {
+        vm.prank(who);
+        d = router.swap(
+            key,
+            SwapParams(zeroForOne, -int256(amountIn), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1),
+            PoolSwapTest.TestSettings(false, false),
+            ""
+        );
+    }
+
+    function _agent(address owner_) internal returns (SeatAgent a) {
+        vm.prank(owner_);
+        a = new SeatAgent(PM, hook);
+        _fund(address(a), 1_000_000e6, 1_000e18);
+    }
+
+    function _usdgIs0() internal view returns (bool) {
+        return Currency.unwrap(key.currency0) == USDG;
+    }
+
+    function _usdg(address who) internal view returns (uint256) {
+        return ERC20(USDG).balanceOf(who);
+    }
+
+    function _spcx(address who) internal view returns (uint256) {
+        return ERC20(SPCX).balanceOf(who);
+    }
+}
