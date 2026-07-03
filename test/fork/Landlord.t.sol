@@ -88,3 +88,93 @@ contract LandlordForkTest is Fixture {
         assertApproxEqAbs(_spcx(lp1), s0, 2);
         assertApproxEqAbs(_usdg(lp1), u0, 2);
     }
+
+    function test_slippageAndPriceBounds() public {
+        vm.startPrank(lp1);
+        vm.expectRevert(Landlord.SlippageExceeded.selector);
+        hook.addLiquidity(key, L, 1, type(uint256).max, 0, type(uint160).max);
+        vm.expectRevert(Landlord.PriceOutOfBounds.selector);
+        hook.addLiquidity(key, L, type(uint256).max, type(uint256).max, startPrice + 1, type(uint160).max);
+        vm.expectRevert(Landlord.ZeroLiquidity.selector);
+        hook.addLiquidity(key, 0, type(uint256).max, type(uint256).max, 0, type(uint160).max);
+        vm.stopPrank();
+        _add(lp1, L);
+        vm.prank(lp2);
+        vm.expectRevert(Landlord.InsufficientLiquidity.selector);
+        hook.removeLiquidity(key, 1, 0, 0, 0, type(uint160).max);
+    }
+
+    // -----------------------------------------------------------------
+    // No seat: a normal 0.3% pool for the LPs
+    // -----------------------------------------------------------------
+
+    function test_noSeatFeeGoesToLpsByLiquidity() public {
+        _add(lp1, L);
+        _add(lp2, L / 2);
+        assertEq(hook.currentFee(id), 3000);
+        BalanceDelta d = _swap(trader, false, 10_000e6); // USDG in, SPCX out
+        uint256 out = uint256(int256(d.amount0()));
+        // fee is 0.3% of the gross output, taken from it
+        uint256 fee = (out * 1_000_000 / 997_000) * 3000 / 1_000_000;
+        (uint256 o0,) = hook.owed(key, lp1);
+        (uint256 p0,) = hook.owed(key, lp2);
+        assertApproxEqRel(o0 + p0, fee, 1e15);
+        assertApproxEqAbs(o0, 2 * p0, 2);
+        vm.prank(lp1);
+        (uint256 c0,) = hook.collect(key, lp1);
+        assertEq(c0, o0, "collect pays what owed() shows");
+    }
+
+    // -----------------------------------------------------------------
+    // The seat: rent to LPs, fees to the holder
+    // -----------------------------------------------------------------
+
+    function test_lpsReceiveRentOwedExactly() public {
+        _add(lp1, L);
+        SeatAgent agent = _agent(agentOwner);
+        uint128 rent = 5_000; // 0.005 USDG a block, $432 a day
+        vm.prank(agentOwner);
+        agent.bid(id, 2000, rent, rent * K * 4);
+
+        vm.roll(vm.getBlockNumber() + K - 1);
+        assertEq(hook.getBid(id, true).manager, address(0), "no seat before K blocks");
+        vm.roll(vm.getBlockNumber() + 1);
+        assertEq(hook.getBid(id, true).manager, address(agent), "seat after K blocks");
+
+        uint256 n1 = 1234;
+        vm.roll(vm.getBlockNumber() + n1);
+        _add(lp2, L / 2); // joins: rent before this goes to lp1 alone
+        uint256 n2 = 3000;
+        vm.roll(vm.getBlockNumber() + n2);
+        hook.updateStateMachine(id);
+
+        uint256 toLps1 = rent * n1 - _burn(rent * n1);
+        uint256 toLps2 = rent * n2 - _burn(rent * n2);
+        (, uint256 r1) = hook.owed(key, lp1);
+        (, uint256 r2) = hook.owed(key, lp2);
+        assertApproxEqAbs(r1, toLps1 + toLps2 * 2 / 3, 2, "lp1 rent");
+        assertApproxEqAbs(r2, toLps2 / 3, 2, "lp2 rent");
+        assertEq(hook.burnBucket(), _burn(rent * n1) + _burn(rent * n2), "burn share");
+
+        uint256 before = _usdg(lp1);
+        vm.prank(lp1);
+        hook.collect(key, lp1);
+        assertEq(_usdg(lp1) - before, r1, "rent paid out in USDG");
+    }
+
+    function test_holderSwapsFreeOthersPayTheHolder() public {
+        _add(lp1, L);
+        SeatAgent agent = _seat(agentOwner, 5000, 2000);
+
+        uint256 spcxBefore = _spcx(address(agent));
+        vm.prank(agentOwner);
+        BalanceDelta free = agent.swap(key, false, -int256(10_000e6), TickMath.MAX_SQRT_PRICE - 1);
+        assertEq(_spcx(address(agent)) - spcxBefore, uint256(int256(free.amount0())));
+        assertEq(hook.getFees(address(agent), key.currency0), 0, "no fee on own swap");
+
+        // undo the price move so the trader sees the same price
+        vm.prank(agentOwner);
+        agent.swap(key, true, -int256(free.amount0()), TickMath.MIN_SQRT_PRICE + 1);
+
+        BalanceDelta paid = _swap(trader, false, 10_000e6);
+        uint256 gross = uint256(int256(free.amount0()));
