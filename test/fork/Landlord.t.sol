@@ -178,3 +178,93 @@ contract LandlordForkTest is Fixture {
 
         BalanceDelta paid = _swap(trader, false, 10_000e6);
         uint256 gross = uint256(int256(free.amount0()));
+        uint256 net = uint256(int256(paid.amount0()));
+        assertApproxEqRel(gross - net, gross * 2000 / 1_000_000, 1e14, "trader paid 0.2%");
+        assertApproxEqAbs(hook.getFees(address(agent), key.currency0), gross - net, 10, "fee to holder");
+        (uint256 o0,) = hook.owed(key, lp1);
+        assertEq(o0, 0, "LPs earn rent, not fees, while the seat is held");
+
+        uint256 booked = hook.getFees(address(agent), key.currency0);
+        uint256 b = _spcx(agentOwner);
+        vm.prank(agentOwner);
+        agent.claimFees(key.currency0);
+        assertEq(_spcx(agentOwner) - b, booked);
+        assertEq(hook.getFees(address(agent), key.currency0), 0);
+    }
+
+    function test_feeChangeAppliesFromTheNextBlock() public {
+        _add(lp1, L);
+        SeatAgent agent = _seat(agentOwner, 5000, 1000);
+        vm.prank(agentOwner);
+        agent.setFee(id, 9000, true);
+        assertEq(hook.currentFee(id), 1000, "same block: old fee");
+        uint256 f0 = _feeOn(1000e6);
+        vm.roll(vm.getBlockNumber() + 1);
+        assertEq(hook.currentFee(id), 9000);
+        uint256 f1 = _feeOn(1000e6);
+        assertApproxEqRel(f1, f0 * 9, 1e16);
+
+        vm.prank(agentOwner);
+        vm.expectRevert(AmAmm.AmAmm__InvalidFee.selector);
+        agent.setFee(id, 10_001, true);
+    }
+
+    function test_outbidTakesOverAfterKAndRefundsHolder() public {
+        _add(lp1, L);
+        SeatAgent a = _seat(agentOwner, 5000, 3000);
+        SeatAgent b = _agent(rivalOwner);
+        uint256 heldFrom = vm.getBlockNumber();
+        vm.prank(rivalOwner);
+        b.bid(id, 2500, 5501, 5501 * K * 2);
+        vm.roll(vm.getBlockNumber() + K - 1);
+        assertEq(hook.getBid(id, true).manager, address(a), "holder keeps the seat for K blocks");
+        vm.roll(vm.getBlockNumber() + 1);
+        assertEq(hook.getBid(id, true).manager, address(b));
+        hook.updateStateMachine(id);
+        // a paid exactly K blocks; the rest of its 4K deposit is refunded
+        assertEq(hook.getRefund(address(a), id), 5000 * uint256(K) * 4 - 5000 * (vm.getBlockNumber() - heldFrom));
+        vm.prank(agentOwner);
+        uint256 got = a.claimRefund(id);
+        assertEq(got, 5000 * uint256(K) * 3);
+    }
+
+    function test_seatRunsDryThenPoolReturnsToDefaultFee() public {
+        _add(lp1, L);
+        SeatAgent a = _agent(agentOwner);
+        vm.prank(agentOwner);
+        a.bid(id, 500, 5000, 5000 * K);
+        vm.roll(vm.getBlockNumber() + 2 * K);
+        hook.updateStateMachine(id);
+        assertEq(hook.getBid(id, true).manager, address(0));
+        assertEq(hook.currentFee(id), 3000);
+        (, uint256 r) = hook.owed(key, lp1);
+        assertApproxEqAbs(r, 5000 * uint256(K) - _burn(5000 * uint256(K)), 2, "whole deposit paid out as rent");
+    }
+
+    function test_rentBelowReserveIsRefused() public {
+        _add(lp1, L);
+        SeatAgent a = _agent(agentOwner);
+        vm.prank(agentOwner);
+        vm.expectRevert(AmAmm.AmAmm__InvalidBid.selector);
+        a.bid(id, 3000, 30, 30 * K); // pool is worth ~$1.2M: reserve is ~39 units a block
+    }
+
+    function test_withdrawalFeeGoesToHolder() public {
+        _add(lp1, L);
+        SeatAgent a = _seat(agentOwner, 5000, 3000);
+        (uint256 b0, uint256 b1) = _remove(lp1, L / 2);
+        uint256 f0 = hook.getFees(address(a), key.currency0);
+        uint256 f1 = hook.getFees(address(a), key.currency1);
+        assertApproxEqAbs(f0, (b0 + f0) * 13 / 1_000_000, 1);
+        assertApproxEqAbs(f1, (b1 + f1) * 13 / 1_000_000, 1);
+        assertGt(f1, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // The holder cannot reach LP principal
+    // -----------------------------------------------------------------
+
+    function test_holderCannotTouchLpPrincipal() public {
+        (uint256 a0, uint256 a1) = _add(lp1, L);
+        SeatAgent a = _seat(agentOwner, 5000, 10_000);
+
