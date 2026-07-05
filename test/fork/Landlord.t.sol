@@ -268,3 +268,93 @@ contract LandlordForkTest is Fixture {
         (uint256 a0, uint256 a1) = _add(lp1, L);
         SeatAgent a = _seat(agentOwner, 5000, 10_000);
 
+        // everything a holder can do, round trips at its zero fee included
+        for (uint256 i; i < 5; ++i) {
+            vm.startPrank(agentOwner);
+            BalanceDelta d = a.swap(key, false, -int256(50_000e6), TickMath.MAX_SQRT_PRICE - 1);
+            a.swap(key, true, -int256(d.amount0()), TickMath.MIN_SQRT_PRICE + 1);
+            a.setFee(id, uint24(i * 2000), true);
+            vm.stopPrank();
+            vm.roll(vm.getBlockNumber() + 1);
+        }
+        vm.startPrank(address(a));
+        vm.expectRevert(Landlord.InsufficientLiquidity.selector);
+        hook.removeLiquidity(key, 1, 0, 0, 0, type(uint160).max);
+        (uint256 c0, uint256 c1) = hook.collect(key, address(a));
+        assertEq(c0 + c1, 0, "holder has no LP claim");
+        vm.stopPrank();
+
+        (uint256 b0, uint256 b1) = _remove(lp1, L);
+        // the LP leaves with its deposit's value (less the 13 ppm exit fee) at the starting price;
+        // zero-fee round trips can only shift a few wei between the two sides
+        assertGe(_value(b0, b1), _value(a0, a1) * (1_000_000 - 13) / 1_000_000 - 1);
+        (, uint256 rent) = hook.owed(key, lp1);
+        assertGt(rent, 0, "and its rent");
+    }
+
+    // -----------------------------------------------------------------
+    // Griefing is bounded by K and by the 10% raise
+    // -----------------------------------------------------------------
+
+    function test_queueGriefingOnlyRaisesTheRent() public {
+        _add(lp1, L);
+        SeatAgent holder = _seat(agentOwner, 5000, 3000);
+        SeatAgent g1 = _agent(rivalOwner);
+        SeatAgent g2 = _agent(makeAddr("griefer2"));
+        vm.prank(agentOwner);
+        holder.depositIntoBid(id, 5000 * K * 4, true); // enough to outlast the whole attack
+        uint128 rent = 5000;
+        // two griefers keep replacing each other's queued bid just before it would start
+        for (uint256 i; i < 6; ++i) {
+            rent = rent * 111 / 100;
+            SeatAgent g = i % 2 == 0 ? g1 : g2;
+            vm.prank(g.owner());
+            g.bid(id, 3000, rent, rent * K);
+            vm.roll(vm.getBlockNumber() + K - 1);
+            assertEq(hook.getBid(id, true).manager, address(holder), "seat never changes hands early");
+        }
+        // the last griefer must now take the seat and pay at least 1.1^6 times the old rent
+        vm.roll(vm.getBlockNumber() + 1);
+        Landlord.Bid memory top = hook.getBid(id, true);
+        assertEq(top.manager, address(g2));
+        assertGe(top.rent, 5000 * 177 / 100);
+        // and every replaced queued bid got its full deposit back
+        assertGt(hook.getRefund(address(g1), id), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Burn: the burn share of rent buys the token and sends it to 0xdEaD
+    // -----------------------------------------------------------------
+
+    function test_crankBuysAndBurns() public {
+        _add(lp1, L);
+        _seat(agentOwner, 50_000, 3000);
+        vm.roll(vm.getBlockNumber() + 1000);
+        hook.updateStateMachine(id);
+        uint256 bucket = hook.burnBucket();
+        assertEq(bucket, _burn(50_000 * 1000));
+
+        address dead = hook.DEAD();
+        uint256 deadBefore = standIn.balanceOf(dead);
+        vm.prank(makeAddr("anyone"));
+        (uint256 spent, uint256 burned) = hook.crankBurn();
+        assertEq(spent, bucket);
+        assertGt(burned, 0);
+        assertEq(standIn.balanceOf(dead) - deadBefore, burned);
+        assertEq(hook.totalBurned(), burned);
+        assertEq(hook.burnBucket(), 0);
+
+        vm.expectRevert(Landlord.BurnAlreadyCrankedThisBlock.selector);
+        hook.crankBurn();
+        vm.roll(vm.getBlockNumber() + 1);
+        vm.expectRevert(Landlord.NothingToBurn.selector);
+        hook.crankBurn();
+    }
+
+    function test_crankSpendsAtMostTenthOfAPercentOfDepth() public {
+        _add(lp1, L);
+        _seat(agentOwner, 5_000_000, 3000); // $5 a block
+        vm.roll(vm.getBlockNumber() + 5000);
+        hook.updateStateMachine(id);
+        uint256 bucket = hook.burnBucket();
+        (uint256 spent,) = hook.crankBurn();
