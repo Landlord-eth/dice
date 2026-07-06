@@ -358,3 +358,88 @@ contract LandlordForkTest is Fixture {
         hook.updateStateMachine(id);
         uint256 bucket = hook.burnBucket();
         (uint256 spent,) = hook.crankBurn();
+        // burn pool holds ~$10,000 of USDG in range: 0.1% is ~$10
+        assertLt(spent, bucket);
+        assertApproxEqRel(spent, 10e6, 0.02e18);
+    }
+
+    function test_sandwichingTheCrankLosesMoney() public {
+        _add(lp1, L);
+        _seat(agentOwner, 5_000_000, 3000);
+        vm.roll(vm.getBlockNumber() + 5000);
+        hook.updateStateMachine(id);
+
+        address attacker = makeAddr("attacker");
+        _fund(attacker, 100_000e6, 0);
+        vm.startPrank(attacker);
+        ERC20(USDG).approve(address(router), type(uint256).max);
+        standIn.approve(address(router), type(uint256).max);
+        bool usdgIs0 = Currency.unwrap(burnKey.currency0) == USDG;
+        uint256 u0 = _usdg(attacker);
+        // push the burn token's price up with $2,000, let the crank buy, sell everything back
+        BalanceDelta d = router.swap(
+            burnKey,
+            SwapParams(usdgIs0, -int256(2_000e6), usdgIs0 ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1),
+            PoolSwapTest.TestSettings(false, false),
+            ""
+        );
+        vm.stopPrank();
+        hook.crankBurn();
+        uint256 got = uint256(int256(usdgIs0 ? d.amount1() : d.amount0()));
+        vm.prank(attacker);
+        router.swap(
+            burnKey,
+            SwapParams(!usdgIs0, -int256(got), usdgIs0 ? TickMath.MAX_SQRT_PRICE - 1 : TickMath.MIN_SQRT_PRICE + 1),
+            PoolSwapTest.TestSettings(false, false),
+            ""
+        );
+        assertLt(_usdg(attacker), u0, "attacker ends with less USDG");
+    }
+
+    function test_deploysThroughCreate2AtAFlaggedAddress() public {
+        bytes memory initCode = abi.encodePacked(
+            type(Landlord).creationCode, abi.encode(PM, Currency.wrap(USDG), Currency.wrap(address(standIn)), burnKey)
+        );
+        (bytes32 salt, address predicted) = HookAddress.find(initCode);
+        (bool ok,) = HookAddress.CREATE2_DEPLOYER.call(abi.encodePacked(salt, initCode));
+        assertTrue(ok);
+        assertGt(predicted.code.length, 0);
+        assertEq(uint160(predicted) & Hooks.ALL_HOOK_MASK, HookAddress.FLAGS);
+        assertEq(Currency.unwrap(Landlord(predicted).quote()), USDG);
+    }
+
+    function test_burnPoolMustBePlainAndCharged() public {
+        PoolKey memory bad = burnKey;
+        bad.fee = 500;
+        vm.expectRevert(Landlord.InvalidBurnPool.selector);
+        new Landlord(PM, Currency.wrap(USDG), Currency.wrap(address(standIn)), bad);
+    }
+
+    // -----------------------------------------------------------------
+
+    function _seat(address owner_, uint128 rent, uint24 fee) internal returns (SeatAgent a) {
+        a = _agent(owner_);
+        vm.prank(owner_);
+        a.bid(id, fee, rent, rent * K * 4);
+        vm.roll(vm.getBlockNumber() + K);
+        hook.updateStateMachine(id);
+        require(hook.getBid(id, true).manager == address(a), "seat");
+    }
+
+    function _burn(uint256 rent) internal view returns (uint256) {
+        return rent * hook.BURN_SHARE() / 1_000_000;
+    }
+
+    /// @dev USDG value of an (SPCX, USDG) pair at the fixture's opening price.
+    function _value(uint256 spcx, uint256 usdg) internal view returns (uint256) {
+        return usdg + FullMath.mulDiv(FullMath.mulDiv(spcx, startPrice, 1 << 96), startPrice, 1 << 96);
+    }
+
+    /// @dev Fee the holder books on a trader's USDG -> SPCX swap of `amount`, price restored after.
+    function _feeOn(uint256 amount) internal returns (uint256 fee) {
+        address m = hook.getBid(id, true).manager;
+        uint256 before = hook.getFees(m, key.currency0);
+        _swap(trader, false, amount);
+        fee = hook.getFees(m, key.currency0) - before;
+    }
+}
