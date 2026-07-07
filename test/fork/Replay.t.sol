@@ -78,3 +78,83 @@ library ReplayMath {
 contract ReplayForkTest is Fixture {
     using StateLibrary for IPoolManager;
     using PoolIdLibrary for PoolKey;
+
+    uint128 constant LIQ = 8e16; // about $1M of each token at $147
+    uint256 constant PIPS = 1e6;
+
+    uint256[] steps;
+    uint160[] prices;
+    uint256 windowStart;
+    uint48 K;
+    Arbitrageur arb;
+
+    struct Plain {
+        int256 lp; // LP result vs holding, USDG units
+        int256 flow; // LP result vs a portfolio rebalanced at the market price: -(arbitrage taken) + rebates
+        int256 arb; // arbitrageur profit at market prices
+        uint256 donated;
+        uint256 volume; // USDG side of the arbitrage trades
+    }
+
+    struct Seat {
+        int256 lp; // LP result vs holding, rent included
+        int256 flow; // LP result vs a portfolio rebalanced at the market price, rent included
+        int256 gross; // seat holder's arbitrage profit + fees, before rent
+        uint256 rent; // rent per block
+        uint256 rentPaid; // total rent paid by the holder
+        int256 outside; // outside arbitrageurs' profit
+        bool floorBinds;
+    }
+
+    function setUp() public override {
+        super.setUp();
+        K = hook.K();
+        arb = new Arbitrageur(PM);
+        _fund(address(arb), 1_000_000_000e6, 10_000_000e18);
+        _fund(address(this), 100_000_000e6, 1_000_000e18);
+        ERC20(SPCX).approve(address(liqRouter), type(uint256).max);
+        ERC20(SPCX).approve(address(hook), type(uint256).max);
+        ERC20(USDG).approve(address(hook), type(uint256).max);
+    }
+
+    function test_replay_blockPath_fee30bp() public {
+        _run("research/data/spcx_path_block.json", "block", 3000);
+    }
+
+    function test_replay_blockPath_fee5bp() public {
+        _run("research/data/spcx_path_block.json", "block", 500);
+    }
+
+    function test_replay_blockPath_fee100bp() public {
+        _run("research/data/spcx_path_block.json", "block", 10_000);
+    }
+
+    function test_replay_minutePath_fee30bp() public {
+        _run("research/data/spcx_path_minute.json", "minute", 3000);
+    }
+
+    function _run(string memory file, string memory pathName, uint24 fee) internal {
+        _load(file);
+        windowStart = vm.getBlockNumber() + K;
+        uint256 snap = vm.snapshotState();
+
+        Plain memory plain = _plain(fee, false);
+        vm.revertToState(snap);
+        Plain memory rebate = _plain(fee, true);
+        vm.revertToState(snap);
+
+        Seat memory race1 = _seat(fee, true, PIPS, snap);
+        Seat memory race5 = _seat(fee, true, PIPS / 2, snap);
+        Seat memory mgr1 = _seat(fee, false, PIPS, snap);
+        Seat memory mgr5 = _seat(fee, false, PIPS / 2, snap);
+
+        uint256 poolValue = uint256(ReplayMath.value(int256(_amount0(prices[0])), int256(_amount1(prices[0])), prices[0]));
+        string memory row = string.concat(pathName, "_", vm.toString(fee));
+        vm.serializeUint(row, "fee_pips", fee);
+        vm.serializeUint(row, "steps", steps.length);
+        vm.serializeUint(row, "window_blocks", steps[steps.length - 1] + 1);
+        vm.serializeUint(row, "pool_value_usdg_units", poolValue);
+        vm.serializeInt(row, "plain_lp", plain.lp);
+        vm.serializeInt(row, "plain_flow", plain.flow);
+        vm.serializeInt(row, "rebate_flow", rebate.flow);
+        vm.serializeInt(row, "race_full_flow", race1.flow);
