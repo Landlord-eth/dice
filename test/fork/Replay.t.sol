@@ -158,3 +158,83 @@ contract ReplayForkTest is Fixture {
         vm.serializeInt(row, "plain_flow", plain.flow);
         vm.serializeInt(row, "rebate_flow", rebate.flow);
         vm.serializeInt(row, "race_full_flow", race1.flow);
+        vm.serializeInt(row, "race_half_flow", race5.flow);
+        vm.serializeInt(row, "mgr_full_flow", mgr1.flow);
+        vm.serializeInt(row, "mgr_half_flow", mgr5.flow);
+        vm.serializeUint(row, "burn_share_pips", hook.BURN_SHARE());
+        vm.serializeInt(row, "plain_arb_profit", plain.arb);
+        vm.serializeUint(row, "plain_arb_volume", plain.volume);
+        vm.serializeInt(row, "rebate_lp", rebate.lp);
+        vm.serializeUint(row, "rebate_donated", rebate.donated);
+        vm.serializeInt(row, "race_full_lp", race1.lp);
+        vm.serializeInt(row, "race_full_seat_gross", race1.gross);
+        vm.serializeInt(row, "race_full_outside_arb", race1.outside);
+        vm.serializeUint(row, "race_full_rent_per_block", race1.rent);
+        vm.serializeBool(row, "race_full_floor_binds", race1.floorBinds);
+        vm.serializeInt(row, "race_half_lp", race5.lp);
+        vm.serializeUint(row, "race_half_rent_per_block", race5.rent);
+        vm.serializeInt(row, "mgr_full_lp", mgr1.lp);
+        string memory json = vm.serializeInt(row, "mgr_full_seat_gross", mgr1.gross);
+        vm.writeJson(json, string.concat("research/out/replay_", row, ".json"));
+
+        console2.log("path, fee pips", pathName, fee);
+        console2.log("pool value USDG", poolValue / 1e6);
+        console2.log("plain LP (USDG units)", plain.lp);
+        console2.log("rebate LP", rebate.lp);
+        console2.log("landlord LP, race, full competition", race1.lp);
+        console2.log("landlord LP, race, half competition", race5.lp);
+        console2.log("landlord LP, holder wins all, full", mgr1.lp);
+
+        // the seat holder at full competition pays all it earns back as rent: LPs keep 90% of it
+        if (!race1.floorBinds) assertApproxEqRel(race1.rentPaid, uint256(race1.gross), 0.01e18);
+    }
+
+    // ---------------------------------------------------------------------
+
+    function _load(string memory file) internal {
+        string memory raw = vm.readFile(file);
+        steps = vm.parseJsonUintArray(raw, ".blocks");
+        string[] memory p = vm.parseJsonStringArray(raw, ".sqrtPrices");
+        delete prices;
+        for (uint256 i; i < p.length; ++i) prices.push(uint160(vm.parseUint(p[i])));
+    }
+
+    /// @dev Plain v4 pool (tick spacing 59/57 so the key is new on the real PoolManager).
+    function _plain(uint24 fee, bool rebate) internal returns (Plain memory r) {
+        PoolKey memory k = PoolKey(key.currency0, key.currency1, fee, rebate ? int24(57) : int24(59), IHooks(address(0)));
+        PM.initialize(k, prices[0]);
+        ModifyLiquidityParams memory full =
+            ModifyLiquidityParams(TickMath.minUsableTick(k.tickSpacing), TickMath.maxUsableTick(k.tickSpacing), int256(uint256(LIQ)), 0);
+        (uint256 u0, uint256 s0) = (_usdg(address(this)), _spcx(address(this)));
+        liqRouter.modifyLiquidity(k, full, "");
+        int256 in0 = int256(s0 - _spcx(address(this)));
+        int256 in1 = int256(u0 - _usdg(address(this)));
+
+        uint256 q = _sqrt((PIPS - fee) * 1e30); // sqrt(1 - fee) * 1e18
+        for (uint256 i; i < steps.length; ++i) {
+            vm.roll(windowStart + steps[i]);
+            (int256 p, uint256 d, uint256 v) = _arbTo(k, prices[i], q, rebate);
+            r.arb += p;
+            r.donated += d;
+            r.volume += v;
+        }
+        (u0, s0) = (_usdg(address(this)), _spcx(address(this)));
+        full.liquidityDelta = -full.liquidityDelta;
+        liqRouter.modifyLiquidity(k, full, "");
+        int256 out0 = int256(_spcx(address(this)) - s0);
+        int256 out1 = int256(_usdg(address(this)) - u0);
+        uint160 last = prices[prices.length - 1];
+        r.lp = ReplayMath.value(out0, out1, last) - ReplayMath.value(in0, in1, last);
+        // fees the arbitrageur paid went to the LP, so the LP's loss at market prices is its net profit
+        r.flow = -r.arb + int256(r.donated);
+    }
+
+    /// @dev LANDLORD pool. Pass 1 seats a holder at the reserve rent and measures what the seat
+    /// earns; pass 2 replays with the rent a bidder at `competition` (pips of the seat's earnings)
+    /// would pay, through a real bid, and measures what the LP ends with.
+    function _seat(uint24 fee, bool race, uint256 competition, uint256 snap) internal returns (Seat memory r) {
+        vm.revertToState(snap);
+        Seat memory pass1 = _seatPass(fee, race, 0);
+        vm.revertToState(snap);
+        uint256 blocks = steps[steps.length - 1] + 1;
+        uint256 rent = pass1.gross > 0 ? uint256(pass1.gross) * competition / PIPS / blocks : 0;
