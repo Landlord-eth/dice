@@ -238,3 +238,80 @@ contract ReplayForkTest is Fixture {
         vm.revertToState(snap);
         uint256 blocks = steps[steps.length - 1] + 1;
         uint256 rent = pass1.gross > 0 ? uint256(pass1.gross) * competition / PIPS / blocks : 0;
+        r = _seatPass(fee, race, rent);
+    }
+
+    function _seatPass(uint24 fee, bool race, uint256 rentWanted) internal returns (Seat memory r) {
+        // move the empty pool to the session's opening price, then add the LP
+        router.swap(key, SwapParams(prices[0] < startPrice, -1, prices[0]), PoolSwapTest.TestSettings(false, false), "");
+        (uint256 u0, uint256 s0) = (_usdg(lp1), _spcx(lp1));
+        _add(lp1, LIQ);
+        int256 in0 = int256(s0 - _spcx(lp1));
+        int256 in1 = int256(u0 - _usdg(lp1));
+
+        SeatAgent holder = new SeatAgent(PM, hook);
+        _fund(address(holder), 500_000_000e6, 1_000_000e18);
+        uint128 floor_ = hook.minRent(id);
+        r.rent = rentWanted < floor_ ? floor_ : rentWanted;
+        r.floorBinds = rentWanted != 0 && rentWanted < floor_;
+        uint256 blocks = steps[steps.length - 1] + 1;
+        holder.bid(id, fee, uint128(r.rent), uint128(r.rent * (blocks + 2 * uint256(K))));
+        vm.roll(windowStart);
+
+        uint256 q = _sqrt((PIPS - fee) * 1e30);
+        for (uint256 i; i < steps.length; ++i) {
+            vm.roll(windowStart + steps[i]);
+            uint160 market = prices[i];
+            if (race) {
+                (int256 p,,) = _arbTo(key, market, q, false);
+                r.outside += p;
+            }
+            (uint160 now_,,,) = PM.getSlot0(id);
+            if (now_ != market) {
+                BalanceDelta d = holder.swap(key, now_ > market, -1e30, market);
+                r.gross += ReplayMath.value(d.amount0(), d.amount1(), market);
+            }
+        }
+        vm.roll(windowStart + blocks);
+        hook.updateStateMachine(id);
+        uint160 last = prices[prices.length - 1];
+        r.gross += ReplayMath.value(
+            int256(hook.getFees(address(holder), key.currency0)), int256(hook.getFees(address(holder), key.currency1)), last
+        );
+        r.rentPaid = r.rent * blocks;
+        (, uint256 rentToLp) = hook.owed(key, lp1);
+        // everything the holder and outside arbitrageurs made (fees included) came out of the pool
+        r.flow = int256(rentToLp) - r.gross - r.outside;
+
+        (u0, s0) = (_usdg(lp1), _spcx(lp1));
+        _remove(lp1, LIQ);
+        vm.prank(lp1);
+        hook.collect(key, lp1);
+        int256 out0 = int256(_spcx(lp1) - s0);
+        int256 out1 = int256(_usdg(lp1) - u0);
+        r.lp = ReplayMath.value(out0, out1, last) - ReplayMath.value(in0, in1, last);
+    }
+
+    /// @dev Outside arbitrage to the edge of the no-trade band around `market`.
+    function _arbTo(PoolKey memory k, uint160 market, uint256 q, bool rebate)
+        internal
+        returns (int256 profit, uint256 donated, uint256 volume)
+    {
+        (uint160 p,,,) = PM.getSlot0(k.toId());
+        uint160 up = uint160(uint256(market) * q / 1e18); // buy SPCX up to here
+        uint160 down = uint160(uint256(market) * 1e18 / q); // sell SPCX down to here
+        BalanceDelta d;
+        if (p < up) (d, profit, donated) = arb.trade(k, false, up, market, rebate);
+        else if (p > down) (d, profit, donated) = arb.trade(k, true, down, market, rebate);
+        int128 a1 = d.amount1();
+        volume = uint256(int256(a1 < 0 ? -a1 : a1));
+    }
+
+    function _amount0(uint160 s) internal pure returns (uint256) {
+        return uint256(LIQ) * (1 << 96) / s;
+    }
+
+    function _amount1(uint160 s) internal pure returns (uint256) {
+        return uint256(LIQ) * s / (1 << 96);
+    }
+}
