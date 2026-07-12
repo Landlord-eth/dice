@@ -148,3 +148,68 @@ contract Handler is Test {
 contract SolvencyForkTest is Fixture {
     using StateLibrary for IPoolManager;
 
+    Handler handler;
+
+    function setUp() public override {
+        super.setUp();
+        address[3] memory lps = [lp1, lp2, makeAddr("lp3")];
+        _fund(lps[2], 5_000_000e6, 10_000e18);
+        vm.startPrank(lps[2]);
+        ERC20(USDG).approve(address(hook), type(uint256).max);
+        ERC20(SPCX).approve(address(hook), type(uint256).max);
+        vm.stopPrank();
+        handler = new Handler(hook, PM, router, key, id, lps, [trader, rivalOwner]);
+        vm.startPrank(rivalOwner);
+        ERC20(USDG).approve(address(router), type(uint256).max);
+        ERC20(SPCX).approve(address(router), type(uint256).max);
+        vm.stopPrank();
+        for (uint256 i; i < 3; ++i) _fund(address(handler.agents(i)), 50_000_000e6, 2_000e18);
+        // start with liquidity so swaps and bids have something to act on
+        _add(lp1, 2e16);
+        targetContract(address(handler));
+        // fixed callers: every account the fuzzer touches is one the fork already holds
+        targetSender(lp1);
+    }
+
+    /// @notice Everything the hook owes in USDG and SPCX is in its balance.
+    function invariant_solvent() public view {
+        uint256 owedUsdg = hook.burnBucket();
+        uint256 owedSpcx;
+        AmAmm.Bid memory top = hook.getBid(id, true);
+        AmAmm.Bid memory next = hook.getBid(id, false);
+        owedUsdg += top.deposit + next.deposit;
+        for (uint256 i; i < 3; ++i) {
+            address a = address(handler.agents(i));
+            owedUsdg += hook.getRefund(a, id) + hook.getFees(a, key.currency1);
+            owedSpcx += hook.getFees(a, key.currency0);
+            (uint256 o0, uint256 o1) = hook.owed(key, handler.lps(i));
+            owedSpcx += o0;
+            owedUsdg += o1;
+        }
+        uint256 balUsdg = _usdg(address(hook));
+        uint256 balSpcx = _spcx(address(hook));
+        assertGe(balUsdg, owedUsdg, "USDG short");
+        assertGe(balSpcx, owedSpcx, "SPCX short");
+        // what is left over is rounding dust only
+        assertLe(balUsdg - owedUsdg, handler.calls() + 10, "USDG dust");
+        assertLe(balSpcx - owedSpcx, handler.calls() * 1e6 + 10, "SPCX dust");
+    }
+
+    /// @notice The hook's position is the whole pool and equals the sum of the LP books.
+    function invariant_booksMatchThePool() public view {
+        uint128 sum;
+        for (uint256 i; i < 3; ++i) {
+            (uint128 l,,,,,) = hook.positions(id, handler.lps(i));
+            sum += l;
+        }
+        (,, uint128 total,,,) = hook.pools(id);
+        assertEq(total, sum);
+        assertEq(PM.getLiquidity(id), total);
+    }
+
+    function afterInvariant() external view {
+        assertGt(handler.calls(), 0);
+        console2.log("calls, bids, seat changes", handler.calls(), handler.bids(), handler.seatChanges());
+        console2.log("calls with a seat held, burns", handler.heldCalls(), handler.burns());
+    }
+}
