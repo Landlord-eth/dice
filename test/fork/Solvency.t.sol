@@ -73,3 +73,78 @@ contract Handler is Test {
         if (amount == 0) return;
         vm.prank(lp);
         hook.removeLiquidity(key, amount, 0, 0, 0, type(uint160).max);
+    }
+
+    function collect(uint256 who) external settle {
+        address lp = lps[who % 3];
+        vm.prank(lp);
+        hook.collect(key, lp);
+    }
+
+    function swap(uint256 who, bool zeroForOne, uint256 amount) external settle {
+        if (pm.getLiquidity(id) == 0) return;
+        uint256 a = zeroForOne ? bound(amount, 1e15, 300e18) : bound(amount, 1e5, 40_000e6);
+        vm.prank(traders[who % 2]);
+        router.swap(
+            key,
+            SwapParams(zeroForOne, -int256(a), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1),
+            PoolSwapTest.TestSettings(false, false),
+            ""
+        );
+    }
+
+    function agentSwap(uint256 who, bool zeroForOne, uint256 amount) external settle {
+        if (pm.getLiquidity(id) == 0) return;
+        uint256 a = zeroForOne ? bound(amount, 1e15, 100e18) : bound(amount, 1e5, 15_000e6);
+        agents[who % 3].swap(key, zeroForOne, -int256(a), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1);
+    }
+
+    function bid(uint256 who, uint256 rentSeed, uint256 blocksSeed, uint24 fee) external settle {
+        AmAmm.Bid memory next = hook.getBid(id, false);
+        AmAmm.Bid memory top = hook.getBid(id, true);
+        uint256 base = next.rent > top.rent ? next.rent : top.rent;
+        if (base < 2000) base = 2000;
+        uint128 rent = uint128(base * bound(rentSeed, 80, 200) / 100);
+        uint128 deposit = rent * K * uint128(bound(blocksSeed, 1, 3));
+        try agents[who % 3].bid(id, uint24(bound(fee, 0, 10_000)), rent, deposit) {
+            ++bids;
+        } catch {}
+    }
+
+    function depositMore(uint256 who, bool top, uint256 blocks) external settle {
+        AmAmm.Bid memory b = hook.getBid(id, top);
+        if (b.manager != address(agents[who % 3])) return;
+        agents[who % 3].depositIntoBid(id, b.rent * uint128(bound(blocks, 1, 2000)), top);
+    }
+
+    function withdraw(uint256 who, bool top, uint256 blocks) external settle {
+        AmAmm.Bid memory b = hook.getBid(id, top);
+        if (b.manager != address(agents[who % 3])) return;
+        try agents[who % 3].withdrawFromBid(id, b.rent * uint128(bound(blocks, 1, 2 * uint256(K))), top) {} catch {}
+    }
+
+    function setFee(uint256 who, uint24 fee, bool top) external settle {
+        try agents[who % 3].setFee(id, uint24(bound(fee, 0, 10_000)), top) {} catch {}
+    }
+
+    function claim(uint256 who) external settle {
+        SeatAgent a = agents[who % 3];
+        a.claimRefund(id);
+        a.claimFees(key.currency0);
+        a.claimFees(key.currency1);
+    }
+
+    function roll(uint256 blocks) external settle {
+        vm.roll(vm.getBlockNumber() + bound(blocks, 1, 2 * uint256(K)));
+    }
+
+    function crank() external settle {
+        try hook.crankBurn() {
+            ++burns;
+        } catch {}
+    }
+}
+
+contract SolvencyForkTest is Fixture {
+    using StateLibrary for IPoolManager;
+
