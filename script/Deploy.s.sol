@@ -38,3 +38,41 @@ contract Deploy is Script {
     function run() external returns (Landlord hook, SeatDeskFactory desks) {
         require(block.chainid == 4663, "Robinhood Chain only");
         address burnToken = vm.envAddress("BURN_TOKEN");
+        (address b0, address b1) = USDG < burnToken ? (USDG, burnToken) : (burnToken, USDG);
+        PoolKey memory burnKey = PoolKey(
+            Currency.wrap(b0),
+            Currency.wrap(b1),
+            uint24(vm.envUint("BURN_POOL_FEE")),
+            int24(vm.envInt("BURN_POOL_TICK_SPACING")),
+            IHooks(address(0))
+        );
+
+        bytes memory initCode = abi.encodePacked(
+            type(Landlord).creationCode, abi.encode(PM, Currency.wrap(USDG), Currency.wrap(burnToken), burnKey)
+        );
+        (bytes32 salt, address predicted) = HookAddress.find(initCode);
+        console2.log("hook address", predicted);
+
+        address[] memory tokens = vm.envOr("OPEN_TOKENS", ",", new address[](0));
+        bytes32[] memory refs = vm.envOr("OPEN_REF_POOLS", ",", new bytes32[](0));
+        require(tokens.length == refs.length, "one reference pool per token");
+
+        vm.etch(address(100), type(ArbSysSimulation).runtimeCode);
+        vm.startBroadcast();
+        (bool ok,) = HookAddress.CREATE2_DEPLOYER.call(abi.encodePacked(salt, initCode));
+        require(ok && predicted.code.length != 0, "deploy failed");
+        hook = Landlord(predicted);
+        desks = new SeatDeskFactory(PM, hook);
+        console2.log("desk factory", address(desks));
+        for (uint256 i; i < tokens.length; ++i) {
+            (uint160 price,,,) = PM.getSlot0(PoolId.wrap(refs[i]));
+            require(price != 0, "reference pool not initialized");
+            (address c0, address c1) = USDG < tokens[i] ? (USDG, tokens[i]) : (tokens[i], USDG);
+            PM.initialize(
+                PoolKey(Currency.wrap(c0), Currency.wrap(c1), 0, hook.TICK_SPACING(), IHooks(predicted)), price
+            );
+            console2.log("opened pool for", tokens[i]);
+        }
+        vm.stopBroadcast();
+    }
+}
