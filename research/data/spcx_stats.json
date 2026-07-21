@@ -1,0 +1,19 @@
+{
+ "swaps": 3848,
+ "blocks_with_swaps": 3454,
+ "minutes_with_swaps": 367,
+ "volume_usdg": 879539,
+ "first_price": 150.21,
+ "last_price": 143.9742,
+ "min_price": 143.0632,
+ "max_price": 150.225,
+ "move_per_block_median_pct": 0.0086,
+ "move_per_block_p99_pct": 0.2293,
+ "move_per_minute_median_pct": 0.0557,
+ "ref_pool_fee_median_pips": 3000.0,
+ "ref_pool_fee_p10_p90_pips": [
+  0,
+  3000
+ ],
+ "ref_pool_liquidity_median": 6.402628841176878e+17
+}
