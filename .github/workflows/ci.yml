@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Build
+        run: forge build --sizes
+      - name: Unit tests (no fork)
+        run: forge test --match-path test/AmAmm.t.sol -vv
+      - name: Format check
+        run: forge fmt --check src script
