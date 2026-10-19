@@ -1,6 +1,6 @@
 ![LANDLORD](.github/banner.webp)
 
-[landlord.capital](https://landlord.capital) · [engine](https://github.com/Landlord-eth/engine) · [X](https://x.com/use_dice)
+[landlord.capital](https://landlord.capital) · [X](https://x.com/use_dice)
 
 # LANDLORD engine
 
