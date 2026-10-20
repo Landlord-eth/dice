@@ -4,6 +4,8 @@
 
 # LANDLORD engine
 
+CA: 0xf8b778a693f7c0335e89223546ffd865d90ae9f8
+
 An am-AMM ("am-AMM: An Auction-Managed Automated Market Maker", Adams, Moallemi, Reynolds, Robinson,
 arXiv 2403.03367) as a Uniswap v4 hook for Robinhood Chain stock pools. The seat auction is a port of
 Bunni's BidDog. Designed by researchers from Columbia, Paradigm and Uniswap Labs; we built the hook.
